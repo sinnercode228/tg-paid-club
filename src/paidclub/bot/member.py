@@ -29,7 +29,7 @@ from paidclub.bot.screens import Go, Menu
 from paidclub.bot.ui import show
 from paidclub.container import Core
 from paidclub.db import in_transaction
-from paidclub.domain.subscriptions import LIVE_STATUSES, RenewalMode
+from paidclub.domain.subscriptions import LIVE_STATUSES, RenewalMode, SubStatus
 from paidclub.models import Subscription
 from paidclub.notifications import MessageDraft
 from paidclub.repo import invite_links, upsert_member
@@ -127,7 +127,12 @@ async def toggle_reply(core: Core, user: User, subscription_id: int, *, enable: 
         view = await operation(core, telegram_id=user.id, subscription_id=subscription_id)
     except club.ClubError as exc:
         return await _refused(core, user.id, exc)
-    return await _status(core, view, note="Автопродление снова включено." if enable else None)
+    note = None
+    if enable:
+        # A Stars subscription stays canceled until the member turns renewal on in Telegram.
+        resumed = view.status is not SubStatus.CANCELED
+        note = "Автопродление снова включено." if resumed else screens.STARS_RESUME_NOTE
+    return await _status(core, view, note=note)
 
 
 async def _refused(core: Core, telegram_id: int, exc: club.ClubError) -> Reply:

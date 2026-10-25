@@ -256,6 +256,7 @@ async def _apply_success(
         mode=mode,
         period_end=event.period_end,
         renewal=event.purpose is PaymentPurpose.RENEWAL,
+        paid_at=event.occurred_at,
     )
     assert state.current_period_end is not None
     if before is SubStatus.EXPIRED and state.current_period_end <= now:

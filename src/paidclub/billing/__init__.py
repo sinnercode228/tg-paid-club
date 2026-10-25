@@ -58,6 +58,11 @@ class ProviderRegistry:
             merchant = name not in PROVIDER_RENEWED
         return RenewalMode.MERCHANT if merchant else RenewalMode.PROVIDER
 
+    def provider_renewed(self) -> frozenset[str]:
+        """Names of the providers that renew on their own, registered or not."""
+        registered = {p.name for p in self._providers.values() if not p.supports_merchant_renewal}
+        return PROVIDER_RENEWED | registered
+
     def names(self) -> list[str]:
         return list(self._providers)
 

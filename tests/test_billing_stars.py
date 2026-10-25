@@ -18,7 +18,7 @@ from aiogram.methods import (
     TelegramMethod,
 )
 from aiogram.methods.base import TelegramType
-from aiogram.types import LabeledPrice, SuccessfulPayment, Update
+from aiogram.types import LabeledPrice, SuccessfulPayment, Update, User
 from pydantic import SecretStr
 
 from paidclub import club
@@ -44,6 +44,7 @@ from paidclub.billing.stars import (
     create_stars_router,
     payment_event,
 )
+from paidclub.bot import member, screens
 from paidclub.bot.catalog import catalog
 from paidclub.clock import FakeClock
 from paidclub.config import Settings
@@ -181,6 +182,7 @@ def payment_update(
     user_id: int = MEMBER,
     amount: int = 500,
     update_id: int | None = None,
+    paid_at: datetime = START,
 ) -> Update:
     payment: dict[str, Any] = {
         "currency": "XTR",
@@ -198,7 +200,7 @@ def payment_update(
             "update_id": update_id if update_id is not None else next(_update_ids),
             "message": {
                 "message_id": 100,
-                "date": int(START.timestamp()),
+                "date": int(paid_at.timestamp()),
                 "chat": {"id": user_id, "type": "private"},
                 "from": {"id": user_id, "is_bot": False, "first_name": "Аня"},
                 "successful_payment": payment,
@@ -417,7 +419,11 @@ async def test_after_expiry_the_old_invoice_is_stale_and_a_new_one_reactivates(
         core, session, dispatcher, bot, clock
     )
     await club.cancel(core, telegram_id=MEMBER, subscription_id=sub_id)
-    clock.set(expires)
+    # A canceled Stars subscription waits for a renewal the member may have turned back on.
+    clock.set(expires + timedelta(minutes=59))
+    assert (await Scheduler(core, FakeRevoker()).tick()).expired == 0
+    ended = expires + timedelta(hours=1)
+    clock.set(ended)
     assert (await Scheduler(core, FakeRevoker()).tick()).expired == 1
 
     async def check(payload: str) -> str | None:
@@ -430,14 +436,14 @@ async def test_after_expiry_the_old_invoice_is_stale_and_a_new_one_reactivates(
     payload = session.of(CreateInvoiceLink)[-1].payload
     assert await check(payload) is None
 
-    new_end = expires + THIRTY_DAYS
+    new_end = ended + THIRTY_DAYS
     await dispatcher.feed_update(
         bot, payment_update(payload, charge_id="ch_back", expires=new_end, first=True)
     )
     sub = await load_sub(core, sub_id)
     assert (sub.status, sub.current_period_start, sub.current_period_end) == (
         SubStatus.ACTIVE,
-        expires,
+        ended,
         new_end,
     )
     assert sub.payment_method_id == "ch_back"
@@ -603,7 +609,9 @@ async def test_cancel_and_resume_edit_the_telegram_subscription(
     canceled = await club.cancel(core, telegram_id=MEMBER, subscription_id=sub_id)
     resumed = await club.resume(core, telegram_id=MEMBER, subscription_id=sub_id)
 
-    assert (canceled.status, resumed.status) == (SubStatus.CANCELED, SubStatus.ACTIVE)
+    # Telegram only allows the member to turn renewal back on: until a renewal arrives,
+    # auto-renew is off on our side too.
+    assert (canceled.status, resumed.status) == (SubStatus.CANCELED, SubStatus.CANCELED)
     stop, allow = session.of(EditUserStarSubscription)
     assert (stop.user_id, stop.telegram_payment_charge_id, stop.is_canceled) == (
         MEMBER,
@@ -720,3 +728,77 @@ async def test_without_the_stars_provider_cancel_is_refused_rather_than_pretende
 
     assert (await load_sub(core, sub_id)).status is SubStatus.ACTIVE
     assert session.of(EditUserStarSubscription) == []
+
+
+# --- turning renewal back on --------------------------------------------------------------------
+
+
+async def test_resume_asks_the_member_to_turn_renewal_on_in_telegram(
+    core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot, clock: FakeClock
+) -> None:
+    """editUserStarSubscription(is_canceled=False) only allows the member to re-enable it."""
+    sub_id, _, _ = await paid_stars_subscription(core, session, dispatcher, bot, clock)
+    await club.cancel(core, telegram_id=MEMBER, subscription_id=sub_id)
+
+    user = User(id=MEMBER, is_bot=False, first_name="Аня")
+    reply = await member.toggle_reply(core, user, sub_id, enable=True)
+
+    [_, allow] = session.of(EditUserStarSubscription)
+    assert allow.is_canceled is False
+    assert reply.draft.text.startswith(screens.STARS_RESUME_NOTE)
+    assert "Telegram сам продлит" not in reply.draft.text
+    assert "снова включено" not in reply.draft.text
+    assert screens.STARS_RESUME_BUTTON in [button.text for button in reply.draft.buttons]
+    assert (await load_sub(core, sub_id)).status is SubStatus.CANCELED
+
+
+async def test_a_renewal_after_the_cancel_turns_auto_renew_back_on(
+    core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot, clock: FakeClock
+) -> None:
+    """The member turned renewal back on in Telegram, which renews at the period end."""
+    sub_id, payload, expires = await paid_stars_subscription(core, session, dispatcher, bot, clock)
+    clock.advance(timedelta(days=10))
+    await club.cancel(core, telegram_id=MEMBER, subscription_id=sub_id)
+    await club.resume(core, telegram_id=MEMBER, subscription_id=sub_id)
+
+    clock.set(expires + timedelta(minutes=2))
+    assert (await Scheduler(core, FakeRevoker()).tick()).expired == 0  # waits for Telegram
+    renewed_until = expires + THIRTY_DAYS
+    await dispatcher.feed_update(
+        bot,
+        payment_update(
+            payload, charge_id="ch_2", expires=renewed_until, first=False, paid_at=expires
+        ),
+    )
+
+    sub = await load_sub(core, sub_id)
+    assert (sub.status, sub.canceled_at, sub.current_period_end) == (
+        SubStatus.ACTIVE,
+        None,
+        renewed_until,
+    )
+    assert sub.next_charge_at == renewed_until + timedelta(hours=1)
+
+
+async def test_a_renewal_charged_before_the_cancel_keeps_auto_renew_off(
+    core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot, clock: FakeClock
+) -> None:
+    """Telegram renewed at the period end and the member cancelled a minute later, before
+    the payment update was handled."""
+    sub_id, payload, expires = await paid_stars_subscription(core, session, dispatcher, bot, clock)
+    clock.set(expires + timedelta(minutes=1))
+    await club.cancel(core, telegram_id=MEMBER, subscription_id=sub_id)
+    renewed_until = expires + THIRTY_DAYS
+    await dispatcher.feed_update(
+        bot,
+        payment_update(
+            payload, charge_id="ch_2", expires=renewed_until, first=False, paid_at=expires
+        ),
+    )
+
+    sub = await load_sub(core, sub_id)
+    assert (sub.status, sub.next_charge_at, sub.current_period_end) == (
+        SubStatus.CANCELED,
+        None,
+        renewed_until,
+    )

@@ -498,6 +498,7 @@ class Scheduler:
 
     async def _expire(self, report: TickReport) -> None:
         core = self.core
+        provider_renewed = sorted(core.providers.provider_renewed())
         for _ in range(self.max_batches):
             now = core.clock.now()
             due = or_(
@@ -508,7 +509,15 @@ class Scheduler:
                 ),
                 and_(
                     Subscription.status == SubStatus.CANCELED,
+                    Subscription.provider.not_in(provider_renewed),
                     Subscription.current_period_end <= now,
+                ),
+                # A provider-renewed one waits for a renewal the member may have turned back
+                # on at the provider (see domain.payment_succeeded).
+                and_(
+                    Subscription.status == SubStatus.CANCELED,
+                    Subscription.provider.in_(provider_renewed),
+                    Subscription.current_period_end <= now - core.policy.renewal_wait,
                 ),
             )
             async with core.sessions() as session:
@@ -536,7 +545,9 @@ class Scheduler:
             sub = await session.get(Subscription, sub_id, populate_existing=True)
             if sub is None:
                 return False
-            reason = domain.expiry_due(state_of(sub), now)
+            mode = core.providers.renewal_mode(sub.provider)
+            wait = core.policy.renewal_wait if mode is RenewalMode.PROVIDER else timedelta(0)
+            reason = domain.expiry_due(state_of(sub), now, renewal_wait=wait)
             if reason is None:
                 return False
             write_state(sub, domain.expire(state_of(sub), now=now, reason=reason), now=now)
@@ -612,11 +623,16 @@ class Scheduler:
         core = self.core
         end = sub.current_period_end
         assert end is not None
+        provider_renewed = core.providers.renewal_mode(sub.provider) is RenewalMode.PROVIDER
         if sub.status is SubStatus.CANCELED:
             return texts.reminder_canceled(
-                subscription_id=sub.id, period_end=end, offset=offset, tz=core.tz
+                subscription_id=sub.id,
+                period_end=end,
+                offset=offset,
+                tz=core.tz,
+                provider_renewed=provider_renewed,
             )
-        if core.providers.renewal_mode(sub.provider) is RenewalMode.PROVIDER:
+        if provider_renewed:
             template = texts.reminder_stars
         elif sub.payment_method_id is None:
             template = texts.reminder_manual

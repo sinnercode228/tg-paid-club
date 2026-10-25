@@ -68,6 +68,16 @@ NO_SUBSCRIPTION_INTRO = (
 
 HELP = "Команды: /start — тарифы и оплата, /status — моя подписка."
 
+#: After "resume" on a Telegram Stars subscription: the bot may only allow it, the member
+#: turns renewal back on in Telegram.
+STARS_RESUME_NOTE = (
+    "Telegram снова разрешает продлить подписку, но включить продление нужно вам самим: "
+    "в настройках Telegram откройте раздел Telegram Stars, найдите подписку на клуб и "
+    "включите её. Как только Telegram её продлит, бот пришлёт подтверждение."
+)
+#: The resume button of a canceled Telegram Stars subscription.
+STARS_RESUME_BUTTON = "Как снова включить продление"
+
 
 @dataclass(frozen=True, slots=True)
 class Offer:
@@ -261,7 +271,8 @@ def status(
                 f"Автопродление отключено. Доступ к клубу по подписке «{plan_title}» "
                 f"сохранится до {date(view.period_end)}."
             )
-            buttons.append(Button("Включить автопродление", callback_data=menu_resume))
+            label = STARS_RESUME_BUTTON if provider_renewed else "Включить автопродление"
+            buttons.append(Button(label, callback_data=menu_resume))
         else:
             lines.append(
                 f"Оплаченный период подписки «{plan_title}» закончился, доступ к клубу закрыт."

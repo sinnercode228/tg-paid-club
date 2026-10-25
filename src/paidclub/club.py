@@ -279,6 +279,12 @@ async def cancel(core: Core, *, telegram_id: int, subscription_id: int) -> Subsc
 
 
 async def resume(core: Core, *, telegram_id: int, subscription_id: int) -> SubscriptionView:
+    """Turn auto-renew back on before the period ends.
+
+    For a provider-renewed subscription (Telegram Stars) the provider is only asked to allow
+    renewal again: Telegram renews once the member turns it back on in Telegram, so the
+    returned view is still ``canceled``, and the bot tells the member what to do.
+    """
     return await _toggle(core, telegram_id, subscription_id, enable=True)
 
 
@@ -290,7 +296,12 @@ async def _toggle(
         state = state_of(sub)
         if enable:
             mode = core.providers.renewal_mode(sub.provider)
-            return domain.resume(state, now=now, policy=core.policy, mode=mode)
+            resumed = domain.resume(state, now=now, policy=core.policy, mode=mode)
+            if mode is RenewalMode.PROVIDER:
+                # Telegram only lets the member turn renewal back on themselves; until a
+                # renewal arrives, auto-renew is off (domain.payment_succeeded).
+                return state
+            return resumed
         return domain.cancel(state, now=now)
 
     async def check(session: AsyncSession) -> tuple[str, ProviderSubscriptionRef]:

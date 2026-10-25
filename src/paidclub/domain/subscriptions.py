@@ -13,6 +13,7 @@ States::
 
     expired ──paid (late payment or the "pay" button)──> active, starting from the payment
     expired (after a cancel) ──renewal charge sent before the cancel──> canceled, next period
+    canceled ──Telegram renewed after the cancel (member turned it back on)──> active
 
 Periods are computed from a billing anchor, never from "now": the n-th period after the anchor
 ends at ``anchor + n * plan period``. Paying late does not shift the schedule, and month ends
@@ -144,6 +145,7 @@ def payment_succeeded(
     mode: RenewalMode,
     period_end: datetime | None = None,
     renewal: bool = False,
+    paid_at: datetime | None = None,
 ) -> SubState:
     """Apply a successful payment for the next unpaid period (``periods_paid + 1``).
 
@@ -154,6 +156,10 @@ def payment_succeeded(
     page. A renewal charge can settle after the member turned auto-renew off: it was sent
     before the cancel, or it was still pending. It pays the period after the last paid one,
     and auto-renew stays off, also when the subscription has expired meanwhile.
+
+    A provider-renewed subscription is the exception: the cancel stopped the renewal at the
+    provider, so a renewal the provider charged after it (``paid_at``) means the member turned
+    renewal back on there, and auto-renew is on again.
     """
     paid = state.periods_paid + 1
     late_after_cancel = (
@@ -179,7 +185,14 @@ def payment_succeeded(
     if end <= start:
         raise ValueError(f"paid period would end ({end}) before it starts ({start})")
 
-    keeps_canceled = state.status is SubStatus.CANCELED or late_after_cancel
+    reenabled = (
+        renewal
+        and mode is RenewalMode.PROVIDER
+        and state.canceled_at is not None
+        and paid_at is not None
+        and paid_at >= state.canceled_at
+    )
+    keeps_canceled = (state.status is SubStatus.CANCELED or late_after_cancel) and not reenabled
     return replace(
         anchored,
         status=SubStatus.CANCELED if keeps_canceled else SubStatus.ACTIVE,
@@ -191,7 +204,7 @@ def payment_succeeded(
         past_due_since=None,
         grace_until=None,
         activated_at=state.activated_at or now,
-        canceled_at=None if restarted else state.canceled_at,
+        canceled_at=None if restarted or reenabled else state.canceled_at,
         expired_at=None,
         expire_reason=None,
     )
@@ -315,15 +328,21 @@ def expire(state: SubState, *, now: datetime, reason: ExpireReason) -> SubState:
 # --- questions the scheduler and the bot ask ---------------------------------------------------
 
 
-def expiry_due(state: SubState, now: datetime) -> ExpireReason | None:
+def expiry_due(
+    state: SubState, now: datetime, *, renewal_wait: timedelta = timedelta(0)
+) -> ExpireReason | None:
     """Why the subscription should expire now, or ``None`` if it should not.
 
     A past-due subscription whose last retry is due right now is not expired yet: the retry
     runs first (it may succeed), and only then does the grace window close.
+
+    ``renewal_wait`` is for provider-renewed subscriptions: a canceled one stays until the
+    renewal the member may have turned back on at the provider has had time to arrive.
     """
     if state.status is SubStatus.CANCELED:
         assert state.current_period_end is not None
-        return ExpireReason.CANCELED if state.current_period_end <= now else None
+        ended = state.current_period_end + renewal_wait <= now
+        return ExpireReason.CANCELED if ended else None
     if state.status is SubStatus.PAST_DUE:
         assert state.grace_until is not None
         retry_pending = state.next_charge_at is not None and state.next_charge_at <= now

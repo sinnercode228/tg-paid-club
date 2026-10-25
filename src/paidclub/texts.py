@@ -159,12 +159,19 @@ def reminder_manual(
 
 
 def reminder_canceled(
-    *, subscription_id: int, period_end: datetime, offset: timedelta, tz: tzinfo
+    *,
+    subscription_id: int,
+    period_end: datetime,
+    offset: timedelta,
+    tz: tzinfo,
+    provider_renewed: bool = False,
 ) -> MessageDraft:
+    # For Telegram Stars the button explains how to turn renewal back on in Telegram.
+    label = "Как снова включить продление" if provider_renewed else "Включить автопродление"
     return MessageDraft(
         f"{when_phrase(offset)}, {fmt_date(period_end, tz)}, закончится доступ к клубу: "
         "автопродление отключено.",
-        (Button("Включить автопродление", callback_data=callbacks.resume(subscription_id)),),
+        (Button(label, callback_data=callbacks.resume(subscription_id)),),
     )
 
 
