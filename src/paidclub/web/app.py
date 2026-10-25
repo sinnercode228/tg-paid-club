@@ -4,6 +4,8 @@
 * ``GET``/``POST /fake-checkout/{token}``: the demo payment page, 404 unless the fake provider
   is enabled (:mod:`paidclub.web.fake_checkout`);
 * ``/admin``: the owner's dashboard and CSV export (:mod:`paidclub.web.admin`);
+* ``GET /paid``: where a member lands after a provider's payment page; it sends them back to
+  the bot (:mod:`paidclub.web.pages`);
 * ``POST /telegram/webhook``: Telegram updates, only in webhook mode
   (:mod:`paidclub.web.telegram`);
 * ``GET /healthz``: 200 while the database answers, 503 otherwise (Docker's health check).
@@ -25,6 +27,7 @@ from paidclub import __version__
 from paidclub.container import Core
 from paidclub.web.admin import create_admin_router
 from paidclub.web.fake_checkout import create_fake_checkout_router
+from paidclub.web.pages import BotUsername, create_pages_router
 from paidclub.web.payments import create_webhook_router
 from paidclub.web.telegram import TelegramWebhook
 
@@ -33,7 +36,13 @@ log = logging.getLogger(__name__)
 HEALTH_TIMEOUT_SECONDS = 3.0
 
 
-def create_app(core: Core, *, telegram: TelegramWebhook | None = None) -> FastAPI:
+def create_app(
+    core: Core,
+    *,
+    telegram: TelegramWebhook | None = None,
+    bot_username: BotUsername | None = None,
+) -> FastAPI:
+    """``bot_username`` gives the page after payment its link to the bot."""
     # The API schema lists the webhook routes only; it is of no use to anyone in production.
     docs = core.settings.env != "prod"
     app = FastAPI(
@@ -46,6 +55,7 @@ def create_app(core: Core, *, telegram: TelegramWebhook | None = None) -> FastAP
     app.include_router(create_webhook_router(core))
     app.include_router(create_fake_checkout_router(core))
     app.include_router(create_admin_router(core))
+    app.include_router(create_pages_router(bot_username))
     if telegram is not None:
         app.include_router(telegram.router())
 

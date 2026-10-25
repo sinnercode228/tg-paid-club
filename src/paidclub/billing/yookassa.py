@@ -213,7 +213,7 @@ class YooKassaProvider:
         return cls(
             shop_id=settings.yookassa_shop_id,
             secret_key=settings.yookassa_secret_key.get_secret_value(),
-            return_url=settings.checkout_return_url or settings.public_base_url,
+            return_url=settings.after_payment_url,
             api_url=settings.yookassa_api_url,
             client=client,
             clock=clock,

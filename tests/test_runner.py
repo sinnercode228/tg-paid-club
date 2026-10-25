@@ -134,9 +134,11 @@ async def test_polling_mode_runs_everything_and_stops_cleanly(
     await eventually(lambda: any(m.chat_id == MEMBER for m in session.calls(SendMessage)))
     async with httpx.AsyncClient(base_url=run.base_url) as http:
         health = await http.get("/healthz")
+        after_payment = await http.get("/paid")
     await run.shutdown()
 
     assert health.status_code == 200
+    assert 'href="https://t.me/club_bot"' in after_payment.text
     methods = session.api_methods()
     # A leftover webhook would make getUpdates fail with 409, so it goes first.
     assert methods[0] == "deleteWebhook"

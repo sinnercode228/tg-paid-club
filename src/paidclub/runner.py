@@ -128,7 +128,7 @@ async def build_app(
             )
         return ClubApp(
             core=core,
-            web=create_app(core, telegram=telegram),
+            web=create_app(core, telegram=telegram, bot_username=_username_of(bot)),
             bot=bot,
             dispatcher=dispatcher,
             scheduler=Scheduler(core, TelegramAccessRevoker(bot)),
@@ -150,6 +150,13 @@ async def build_app(
             await bot.session.close()
         await core.aclose()
         raise
+
+
+def _username_of(bot: Bot) -> Callable[[], Awaitable[str | None]]:
+    async def username() -> str | None:
+        return (await bot.me()).username  # cached after the first getMe
+
+    return username
 
 
 # --- web server --------------------------------------------------------------------------------

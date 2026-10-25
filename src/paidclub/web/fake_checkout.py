@@ -27,6 +27,7 @@ from paidclub.billing.fake import CardKind, FakeCheckoutSession, FakeProvider
 from paidclub.container import Core
 from paidclub.db import ConcurrentUpdateError
 from paidclub.models import Payment, PaymentOutcome, PaymentStatus
+from paidclub.web.pages import page
 from paidclub.web.payments import BodyTooLarge, process_webhook, read_body
 
 log = logging.getLogger(__name__)
@@ -68,77 +69,11 @@ CHOICES: dict[str, Choice] = {
     ),
 }
 
-_STYLE = """
-:root {
-  --bg: #f4f5f7; --card: #ffffff; --text: #1d2129; --muted: #646a73; --line: #e3e5e8;
-  --accent: #2b6de8; --accent-text: #ffffff; --ok: #1f8a4c; --bad: #c4372f; --warn: #a86400;
-  --banner: #fff4d6;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #15171a; --card: #1f2226; --text: #e8eaed; --muted: #9aa0a8; --line: #33373d;
-    --accent: #5b8ff0; --accent-text: #0d1117; --ok: #4cc27f; --bad: #ef6b62; --warn: #e0a43a;
-    --banner: #3a3220;
-  }
-}
-:root[data-theme="dark"] {
-  --bg: #15171a; --card: #1f2226; --text: #e8eaed; --muted: #9aa0a8; --line: #33373d;
-  --accent: #5b8ff0; --accent-text: #0d1117; --ok: #4cc27f; --bad: #ef6b62; --warn: #e0a43a;
-  --banner: #3a3220;
-}
-* { box-sizing: border-box; }
-body {
-  margin: 0; padding: 24px 16px; background: var(--bg); color: var(--text);
-  font: 16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}
-main { max-width: 460px; margin: 0 auto; }
-.banner {
-  background: var(--banner); border-radius: 10px; padding: 10px 14px; font-size: 14px;
-  margin-bottom: 16px;
-}
-.card {
-  background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 20px;
-}
-h1 { font-size: 20px; margin: 0 0 4px; }
-.amount { font-size: 32px; font-weight: 700; margin: 12px 0 4px; }
-.muted { color: var(--muted); font-size: 14px; }
-dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 12px; margin: 16px 0 0; }
-dt { color: var(--muted); } dd { margin: 0; overflow-wrap: anywhere; }
-form { margin: 0; }
-button, .button {
-  display: block; width: 100%; margin-top: 12px; padding: 12px 14px; border-radius: 10px;
-  border: 1px solid var(--line); background: transparent; color: var(--text);
-  font: inherit; text-align: left; cursor: pointer; text-decoration: none;
-}
-button.primary, .button.primary {
-  background: var(--accent); border-color: var(--accent); color: var(--accent-text);
-}
-button span { display: block; font-size: 13px; opacity: 0.8; margin-top: 2px; }
-.status {
-  margin-top: 16px; padding: 12px 14px; border-radius: 10px; border: 1px solid var(--line);
-}
-.status.ok { border-color: var(--ok); } .status.ok strong { color: var(--ok); }
-.status.bad { border-color: var(--bad); } .status.bad strong { color: var(--bad); }
-.status.warn { border-color: var(--warn); } .status.warn strong { color: var(--warn); }
-"""
+DEMO_BANNER = "Демо-оплата: это тестовая страница, деньги не списываются."
 
 
 def _page(title: str, content: str, *, status_code: int = 200) -> HTMLResponse:
-    document = f"""<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="robots" content="noindex">
-<title>{html.escape(title)}</title>
-<style>{_STYLE}</style>
-</head>
-<body><main>
-<div class="banner">Демо-оплата: это тестовая страница, деньги не списываются.</div>
-{content}
-</main></body>
-</html>"""
-    return HTMLResponse(document, status_code=status_code)
+    return page(title, content, banner=DEMO_BANNER, status_code=status_code)
 
 
 def _not_found() -> HTMLResponse:

@@ -116,6 +116,35 @@ async def test_production_hides_the_api_docs(settings: Settings, clock: FakeCloc
         await core.aclose()
 
 
+# --- the page after payment ------------------------------------------------------------------
+
+
+async def test_the_page_after_payment_sends_the_member_back_to_the_bot(core: Core) -> None:
+    async def username() -> str | None:
+        return "club_demo_bot"
+
+    async with client(create_app(core, bot_username=username)) as http:
+        response = await http.get("/paid")
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert "Вернитесь в Telegram" in response.text
+    assert 'href="https://t.me/club_demo_bot"' in response.text
+    # YooKassa sends the member here also after a declined or abandoned payment.
+    assert "Если платёж не прошёл" in response.text
+
+
+async def test_the_page_after_payment_works_without_the_bot(core: Core) -> None:
+    async def unreachable() -> str | None:
+        raise httpx.ConnectError("Telegram is unreachable")
+
+    for app in (create_app(core), create_app(core, bot_username=unreachable)):
+        async with client(app) as http:
+            response = await http.get("/paid")
+        assert response.status_code == 200
+        assert "t.me/" not in response.text
+        assert "вернуться в Telegram" in response.text
+
+
 # --- telegram webhook --------------------------------------------------------------------------
 
 

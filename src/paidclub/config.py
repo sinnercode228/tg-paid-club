@@ -29,6 +29,8 @@ STARS_SUBSCRIPTION_PERIOD = timedelta(days=30)
 
 #: Where Telegram delivers updates in webhook mode, under ``public_base_url``.
 TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"
+#: The page that sends a member back to the bot after a provider's payment page.
+RETURN_PAGE_PATH = "/paid"
 #: The Bot API's rule for ``setWebhook``'s ``secret_token``.
 TELEGRAM_SECRET_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,256}")
 #: ``<bot id>:<secret>`` as @BotFather issues it.
@@ -170,7 +172,8 @@ class Settings(BaseSettings):
     admin_token: SecretStr | None = None
     admin_username: str = "admin"
     admin_password: SecretStr | None = None
-    #: Where providers send the member after paying, e.g. ``https://t.me/<your_bot>``.
+    #: Where providers send the member after paying, e.g. ``https://t.me/<your_bot>``. The
+    #: default is the app's own page, see :attr:`after_payment_url`.
     checkout_return_url: str | None = None
 
     # --- plans and billing -----------------------------------------------------------------
@@ -362,6 +365,12 @@ class Settings(BaseSettings):
     @property
     def telegram_webhook_url(self) -> str:
         return f"{self.public_base_url}{TELEGRAM_WEBHOOK_PATH}"
+
+    @property
+    def after_payment_url(self) -> str:
+        """Where the member lands after a provider's payment page: ``checkout_return_url``, or
+        the app's page that sends them back to the bot."""
+        return self.checkout_return_url or f"{self.public_base_url}{RETURN_PAGE_PATH}"
 
 
 @lru_cache

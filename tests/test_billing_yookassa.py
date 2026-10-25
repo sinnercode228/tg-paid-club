@@ -33,6 +33,7 @@ from paidclub.models import PaymentOutcome
 from paidclub.money import Money
 from paidclub.payments import apply_event
 from paidclub.scheduler import Scheduler
+from paidclub.web.app import create_app
 from paidclub.web.payments import create_webhook_router, process_webhook
 from tests.conftest import START
 from tests.helpers import CHAT_ID, FakeRevoker, load_sub, notifications, payments
@@ -367,6 +368,38 @@ async def test_amounts_are_decimal_strings_and_the_return_url_comes_from_setting
     body = json.loads(api.requests[0].content)
     assert body["amount"] == {"value": "2490.00", "currency": "RUB"}
     assert body["confirmation"]["return_url"] == "https://t.me/club_demo_bot"
+
+
+async def test_without_a_return_url_the_member_comes_back_to_the_app_s_page(
+    tmp_path: Path, api: FakeYooKassa, clock: FakeClock
+) -> None:
+    """PAIDCLUB_CHECKOUT_RETURN_URL is blank in the shipped .env.example. The member must not
+    land on a 404 right after paying."""
+    settings = Settings(
+        _env_file=None,  # type: ignore[call-arg]
+        env="test",
+        database_url=f"sqlite+aiosqlite:///{tmp_path / 'yookassa.db'}",
+        public_base_url="https://club.example",
+        providers=["yookassa"],
+        yookassa_shop_id=SHOP_ID,
+        yookassa_secret_key=SECRET,  # type: ignore[arg-type]
+    )
+    async with httpx.AsyncClient(transport=httpx.MockTransport(api.handler)) as client:
+        provider = YooKassaProvider.from_settings(settings, client=client, clock=clock)
+        core = await build_core(settings, clock=clock, providers=ProviderRegistry([provider]))
+        try:
+            await club.start_checkout(
+                core, telegram_id=MEMBER, plan_code="month", provider="yookassa"
+            )
+            return_url = json.loads(api.requests[0].content)["confirmation"]["return_url"]
+            assert return_url == "https://club.example/paid"
+            transport = httpx.ASGITransport(app=create_app(core))
+            async with httpx.AsyncClient(transport=transport, base_url=return_url) as http:
+                page = await http.get(return_url)
+        finally:
+            await core.aclose()
+    assert page.status_code == 200
+    assert "Вернитесь в Telegram" in page.text
 
 
 def test_from_settings_needs_shop_credentials(settings: Settings) -> None:
