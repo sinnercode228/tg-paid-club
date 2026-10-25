@@ -35,6 +35,7 @@ from paidclub.domain.subscriptions import RenewalMode, SubStatus
 from paidclub.models import (
     ChargeAttempt,
     ChargeAttemptStatus,
+    Checkout,
     Payment,
     PaymentOutcome,
     PaymentStatus,
@@ -169,6 +170,15 @@ async def apply_payment_event(
             status=ChargeAttemptStatus.SUCCEEDED if succeeded else ChargeAttemptStatus.FAILED,
             updated_at=now,
         )
+    )
+    await session.execute(
+        update(Checkout)
+        .where(
+            Checkout.provider == event.provider,
+            Checkout.provider_payment_id == event.provider_payment_id,
+            Checkout.next_check_at.is_not(None),
+        )
+        .values(next_check_at=None, result=outcome.value, settled_at=now)
     )
     return ApplyResult(
         outcome, sub.id, status=sub.status, period_end=sub.current_period_end, payment_id=payment.id

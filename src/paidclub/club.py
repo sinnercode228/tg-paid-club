@@ -6,13 +6,20 @@ Errors are :class:`ClubError` subclasses with a ready Russian ``user_message``.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from paidclub.billing.base import BillingProvider, CheckoutRequest, ProviderSubscriptionRef
+from paidclub.billing.base import (
+    BillingProvider,
+    Checkout,
+    CheckoutRequest,
+    ProviderSubscriptionRef,
+)
+from paidclub.checkouts import track_checkout
 from paidclub.container import Core
 from paidclub.db import in_transaction
 from paidclub.domain import subscriptions as domain
@@ -28,6 +35,8 @@ from paidclub.repo import (
     upsert_member,
     write_state,
 )
+
+log = logging.getLogger(__name__)
 
 
 class ClubError(Exception):
@@ -200,6 +209,7 @@ async def start_checkout(
             return_url=core.settings.checkout_return_url,
         )
     )
+    await _track(core, sub_id, billing.name, checkout, for_period=1)
     return CheckoutLink(sub_id, billing.name, price, checkout.url)
 
 
@@ -237,7 +247,28 @@ async def start_repayment(core: Core, *, telegram_id: int, subscription_id: int)
             return_url=core.settings.checkout_return_url,
         )
     )
+    await _track(core, subscription_id, billing.name, checkout, for_period=for_period)
     return CheckoutLink(subscription_id, billing.name, price, checkout.url)
+
+
+async def _track(
+    core: Core, subscription_id: int, provider: str, checkout: Checkout, *, for_period: int
+) -> None:
+    """Remember a checkout the provider created a payment for, so a lost notification is
+    caught by looking the payment up (:mod:`paidclub.checkouts`)."""
+    if checkout.provider_payment_id is None:
+        return
+    try:
+        await track_checkout(
+            core,
+            subscription_id=subscription_id,
+            provider=provider,
+            provider_payment_id=checkout.provider_payment_id,
+            for_period=for_period,
+        )
+    except Exception:
+        # The member already has the link; the notification can still apply the payment.
+        log.exception("could not record checkout %s", checkout.provider_payment_id)
 
 
 async def cancel(core: Core, *, telegram_id: int, subscription_id: int) -> SubscriptionView:

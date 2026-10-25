@@ -16,10 +16,11 @@ A tick does, in this order:
    grace period the member would have had if it had failed, the subscription stops waiting
    for it (:func:`~paidclub.domain.subscriptions.charge_unsettled`): no retry is charged, and
    access ends like after a failed renewal.
-2. **Pending charges.** A charge the provider reported as pending is looked up by its payment
-   id every ``pending_recheck_seconds`` until the provider decides, then applied. This runs
-   for the charge, not the subscription, so a charge that settles after the member cancelled
-   is still recorded.
+2. **Pending charges and checkouts.** A charge the provider reported as pending is looked up
+   by its payment id every ``pending_recheck_seconds`` until the provider decides, then
+   applied. This runs for the charge, not the subscription, so a charge that settles after
+   the member cancelled is still recorded. Checkout payments whose notification may have
+   been lost are looked up the same way (:mod:`paidclub.checkouts`).
 3. **Expiry.** Past-due subscriptions whose grace window closed (and that have no retry due)
    and canceled subscriptions whose paid period ended become ``expired``.
 4. **Access.** Members of expired subscriptions are removed from the club chats.
@@ -51,6 +52,7 @@ from paidclub.billing.base import (
     PaymentPurpose,
     RenewalRequest,
 )
+from paidclub.checkouts import reconcile_checkouts
 from paidclub.container import Core
 from paidclub.db import claim, in_transaction, release
 from paidclub.domain import subscriptions as domain
@@ -80,6 +82,9 @@ class TickReport:
     pending_checked: int = 0
     #: Renewals whose charge stayed undecided until its deadline.
     unsettled: int = 0
+    #: Checkout payments looked up, and those of them applied by the lookup.
+    checkouts_checked: int = 0
+    checkouts_recovered: int = 0
     renewals_missing: int = 0
     expired: int = 0
     removed: int = 0
@@ -117,6 +122,7 @@ class Scheduler:
         for step in (
             self._renewals,
             self._pending_charges,
+            self._checkouts,
             self._expire,
             self._revoke,
             self._remind,
@@ -479,6 +485,14 @@ class Scheduler:
                 report.charge_failed += 1
             else:
                 report.renewed += 1
+
+    async def _checkouts(self, report: TickReport) -> None:
+        result = await reconcile_checkouts(
+            self.core, batch_size=self.batch_size, max_batches=self.max_batches
+        )
+        report.checkouts_checked += result.checked
+        report.checkouts_recovered += result.recovered
+        report.errors += result.errors
 
     # --- 3. expiry -------------------------------------------------------------------------
 

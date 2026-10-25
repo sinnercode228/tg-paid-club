@@ -330,6 +330,36 @@ class ChargeAttempt(Base):
     )
 
 
+class Checkout(Base):
+    """A payment page or invoice the member was sent to, when the provider created a payment
+    for it up front (YooKassa, the fake provider).
+
+    A first payment is otherwise applied only when its notification arrives, and YooKassa
+    stops retrying a notification after 24 hours. The scheduler looks each unsettled one up
+    until the provider decides; the notification, if it comes, settles it the same way.
+    """
+
+    __tablename__ = "checkouts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscription_id: Mapped[int] = mapped_column(ForeignKey("subscriptions.id"))
+    provider: Mapped[str] = mapped_column(String(16))
+    provider_payment_id: Mapped[str] = mapped_column(String(128))
+    for_period: Mapped[int]
+    #: When to look the payment up next; ``None`` once settled or given up.
+    next_check_at: Mapped[datetime | None]
+    checks: Mapped[int] = mapped_column(default=0)
+    #: The payment outcome that settled it, or ``untracked`` / ``abandoned``.
+    result: Mapped[str | None] = mapped_column(String(24))
+    created_at: Mapped[datetime]
+    settled_at: Mapped[datetime | None]
+
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_payment_id", name="uq_checkouts_provider_id"),
+        Index("ix_checkouts_due", "next_check_at"),
+    )
+
+
 # --- notifications and access ------------------------------------------------------------------
 
 
