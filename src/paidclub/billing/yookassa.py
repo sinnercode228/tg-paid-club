@@ -4,7 +4,10 @@ How the API is used (https://yookassa.ru/developers):
 
 * **Auth.** HTTP Basic with the shop id as the user name and the secret key as the password.
 * **Idempotence.** Every POST carries an ``Idempotence-Key``. YooKassa answers a repeated key
-  with the original result for 24 hours after the first request.
+  with the original result for 24 hours after the first request; after that the same key is
+  a new request. So a renewal is never sent again later than :data:`REPEAT_WINDOW` after the
+  first try: the payment is looked up in ``GET /payments`` (by our metadata) instead, and
+  only if none of the earlier requests created one is it sent again.
 * **First payment.** ``capture: true`` (one-stage), ``save_payment_method: true`` and a
   ``redirect`` confirmation: the member pays on YooKassa's page, and the result arrives as a
   webhook. The method can be charged later only if the payment object says
@@ -12,8 +15,12 @@ How the API is used (https://yookassa.ru/developers):
 * **Renewals.** A POST with ``payment_method_id`` and no confirmation. The idempotence key is
   the scheduler's ``paidclub-{subscription}-{period}-{attempt}``, so a retry after a timeout
   or a crash repeats the same request instead of charging again. A ``pending`` answer is
-  re-checked with ``GET /payments/{id}``, because a repeated POST returns the cached first
-  answer.
+  re-checked with ``GET /payments/{id}`` (:meth:`YooKassaProvider.check_payment`), because a
+  repeated POST returns the cached first answer.
+* **Refusals.** Per YooKassa's table of HTTP codes only a 500 leaves the result unknown. A 4xx
+  answer to a renewal (other than 429, too many requests) is final and created no payment, so
+  it is reported as a failed charge and dunning takes over. 401 and 403 are the shop's
+  problem (a reissued key, autopayments not enabled), so the owner is told as well.
 * **Webhooks are not signed.** The body is only trusted for the payment id. The payment is
   then fetched with the shop credentials, and the status of that fetched object is what gets
   applied. A forged notification can at most make us look up a real payment.
@@ -30,12 +37,13 @@ import logging
 import re
 import uuid
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Self
 
 import httpx
 
 from paidclub.billing.base import (
+    NO_SAVED_METHOD,
     BillingEvent,
     ChargeResult,
     Checkout,
@@ -64,6 +72,22 @@ DESCRIPTION_MAX_LENGTH = 128
 IDEMPOTENCE_KEY_MAX_LENGTH = 64
 #: YooKassa answers within 30 seconds (or with a 500), so wait a little longer than that.
 DEFAULT_TIMEOUT = httpx.Timeout(40.0, connect=10.0)
+#: YooKassa remembers an idempotence key for 24 hours. A renewal is sent again with the same
+#: key only within this window; later it is looked up first.
+REPEAT_WINDOW = timedelta(hours=23)
+#: How far before the first request the payment search starts (clock differences).
+SEARCH_MARGIN = timedelta(minutes=10)
+#: Pages of 100 payments searched for a renewal whose answer was lost.
+SEARCH_MAX_PAGES = 20
+#: HTTP answers after which the outcome of a request is unknown and it may be repeated.
+_RETRYABLE_STATUSES = frozenset({429})
+#: Refusals the shop owner has to fix (credentials, permissions of the shop).
+_SHOP_PROBLEMS = {
+    401: "ЮKassa не принимает ключ магазина (invalid_credentials): проверьте "
+    "PAIDCLUB_YOOKASSA_SHOP_ID и PAIDCLUB_YOOKASSA_SECRET_KEY.",
+    403: "ЮKassa отказала в праве на операцию (forbidden): для автосписаний с сохранённой "
+    "карты их должен включить менеджер ЮKassa.",
+}
 
 #: Payment ids are UUID-like; anything else is not looked up (it would go into a URL path).
 _PAYMENT_ID = re.compile(r"^[0-9A-Za-z-]{1,64}$")
@@ -87,6 +111,11 @@ class YooKassaError(ProviderError):
         self.status = status
         self.code = code
         self.parameter = parameter
+
+
+def _iso(moment: datetime) -> str:
+    """UTC in the form YooKassa filters take: ``2018-07-18T10:51:18.139Z``."""
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def _optional_int(value: Any) -> int | None:
@@ -198,7 +227,9 @@ class YooKassaProvider:
         *,
         body: Mapping[str, Any] | None = None,
         idempotence_key: str | None = None,
+        params: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
+        """One API call; returns the JSON object or raises :class:`YooKassaError`."""
         headers = {}
         if idempotence_key is not None:
             if len(idempotence_key) > IDEMPOTENCE_KEY_MAX_LENGTH:
@@ -207,7 +238,12 @@ class YooKassaProvider:
         where = f"YooKassa {method} {path}"
         try:
             response = await self._client.request(
-                method, f"{self._api_url}{path}", json=body, headers=headers, auth=self._auth
+                method,
+                f"{self._api_url}{path}",
+                json=body,
+                params=params,
+                headers=headers,
+                auth=self._auth,
             )
         except httpx.TimeoutException as exc:
             raise YooKassaError(f"{where}: timed out") from exc
@@ -229,14 +265,27 @@ class YooKassaProvider:
                 code=code,
                 parameter=parameter,
             )
-        if not isinstance(data, dict) or "id" not in data or "status" not in data:
+        if not isinstance(data, dict):
             raise YooKassaError(f"{where}: unexpected response {response.text[:200]!r}")
         return data
+
+    async def _payment_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Mapping[str, Any] | None = None,
+        idempotence_key: str | None = None,
+    ) -> dict[str, Any]:
+        payment = await self._request(method, path, body=body, idempotence_key=idempotence_key)
+        if "id" not in payment or "status" not in payment:
+            raise YooKassaError(f"YooKassa {method} {path}: the answer is not a payment")
+        return payment
 
     async def get_payment(self, payment_id: str) -> dict[str, Any]:
         if not _PAYMENT_ID.match(payment_id):
             raise ValueError(f"not a YooKassa payment id: {payment_id!r}")
-        return await self._request("GET", f"/payments/{payment_id}")
+        return await self._payment_request("GET", f"/payments/{payment_id}")
 
     @staticmethod
     def _amount(amount: Money) -> dict[str, str]:
@@ -279,13 +328,17 @@ class YooKassaProvider:
         # recognises a second payment for the same period if both get paid.
         key = str(uuid.uuid4())
         try:
-            payment = await self._request("POST", "/payments", body=body, idempotence_key=key)
+            payment = await self._payment_request(
+                "POST", "/payments", body=body, idempotence_key=key
+            )
         except YooKassaError as exc:
             if exc.status is not None and exc.status < 500:
                 raise
             # Outcome unknown: the same key returns the payment if the first call created it.
             log.warning("retrying checkout for subscription %s: %s", request.subscription_id, exc)
-            payment = await self._request("POST", "/payments", body=body, idempotence_key=key)
+            payment = await self._payment_request(
+                "POST", "/payments", body=body, idempotence_key=key
+            )
         confirmation = payment.get("confirmation") or {}
         url = confirmation.get("confirmation_url") if isinstance(confirmation, dict) else None
         if not url:
@@ -301,9 +354,20 @@ class YooKassaProvider:
                 amount=request.amount,
                 occurred_at=self._clock.now(),
                 purpose=PaymentPurpose.RENEWAL,
-                reason="no_saved_payment_method",
+                reason=NO_SAVED_METHOD,
                 for_period=request.for_period,
                 attempt=request.attempt,
+            )
+        first = request.first_sent_at
+        if first is not None and self._clock.now() - first >= REPEAT_WINDOW:
+            # YooKassa may have forgotten the key: the same request would be a new payment.
+            found = await self._find_renewal(request, since=first - SEARCH_MARGIN)
+            if found is not None:
+                log.info("found renewal %s as payment %s", request.idempotence_key, found["id"])
+                return await self._renewal_result(found)
+            log.info(
+                "renewal %s: no payment from the earlier requests, sending it again",
+                request.idempotence_key,
             )
         metadata = self._metadata(
             subscription_id=request.subscription_id,
@@ -319,12 +383,33 @@ class YooKassaProvider:
             "description": request.description[:DESCRIPTION_MAX_LENGTH],
             "metadata": metadata,
         }
-        payment = await self._request(
-            "POST", "/payments", body=body, idempotence_key=request.idempotence_key
-        )
+        try:
+            payment = await self._payment_request(
+                "POST", "/payments", body=body, idempotence_key=request.idempotence_key
+            )
+        except YooKassaError as exc:
+            if exc.status is None or exc.status >= 500 or exc.status in _RETRYABLE_STATUSES:
+                raise  # outcome unknown: retried later with the same key
+            # A final refusal: YooKassa created no payment, nothing was charged.
+            log.warning("renewal %s refused: %s", request.idempotence_key, exc)
+            return PaymentFailed(
+                provider=self.name,
+                provider_payment_id=f"refused:{request.idempotence_key}",
+                subscription_id=request.subscription_id,
+                amount=request.amount,
+                occurred_at=self._clock.now(),
+                purpose=PaymentPurpose.RENEWAL,
+                reason=str(exc.code or f"http_{exc.status}")[:64],
+                for_period=request.for_period,
+                attempt=request.attempt,
+                owner_note=_SHOP_PROBLEMS.get(exc.status),
+            )
         if payment["status"] in _UNDECIDED:
             # A repeated key returns the first answer as it was; ask for the current state.
             payment = await self.get_payment(str(payment["id"]))
+        return await self._renewal_result(payment)
+
+    async def _renewal_result(self, payment: Mapping[str, Any]) -> ChargeResult:
         try:
             event = payment_event(payment)
         except (KeyError, TypeError, ValueError) as exc:
@@ -340,6 +425,53 @@ class YooKassaProvider:
                 )
             return PaymentPending(provider=self.name, provider_payment_id=str(payment["id"]))
         return event
+
+    async def check_payment(self, provider_payment_id: str) -> ChargeResult | None:
+        if not _PAYMENT_ID.match(provider_payment_id):
+            return None  # one of our synthetic ids (no_method:..., refused:...)
+        try:
+            payment = await self.get_payment(provider_payment_id)
+        except YooKassaError as exc:
+            if exc.status == 404:
+                return None
+            raise
+        return await self._renewal_result(payment)
+
+    async def _find_renewal(
+        self, request: RenewalRequest, *, since: datetime
+    ) -> dict[str, Any] | None:
+        """The payment an earlier request with ``request``'s key created, if any.
+
+        ``GET /payments`` lists the newest first; our metadata names the subscription, period
+        and attempt, which together are the idempotence key.
+        """
+        wanted = {
+            MARKER: "1",
+            "subscription_id": str(request.subscription_id),
+            "for_period": str(request.for_period),
+            "attempt": str(request.attempt),
+            "purpose": PaymentPurpose.RENEWAL.value,
+        }
+        params = {"created_at.gte": _iso(since), "limit": "100"}
+        for _ in range(SEARCH_MAX_PAGES):
+            page = await self._request("GET", "/payments", params=params)
+            items = page.get("items")
+            if not isinstance(items, list):
+                raise YooKassaError("YooKassa GET /payments: the answer is not a list")
+            for item in items:
+                metadata = item.get("metadata") if isinstance(item, dict) else None
+                if isinstance(metadata, Mapping) and all(
+                    metadata.get(key) == value for key, value in wanted.items()
+                ):
+                    return dict(item)
+            cursor = page.get("next_cursor")
+            if not cursor:
+                return None
+            params = {**params, "cursor": str(cursor)}
+        raise YooKassaError(
+            f"more than {SEARCH_MAX_PAGES * 100} payments since {_iso(since)}: "
+            f"cannot tell whether renewal {request.idempotence_key} was charged"
+        )
 
     async def parse_webhook(
         self, headers: Mapping[str, str], body: bytes

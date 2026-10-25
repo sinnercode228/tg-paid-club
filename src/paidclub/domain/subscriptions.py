@@ -232,6 +232,45 @@ def charge_failed(
     )
 
 
+def renewal_deadline(state: SubState, policy: BillingPolicy) -> datetime:
+    """Until when a renewal charge whose outcome is unknown is waited for.
+
+    That is the end of the grace period the member would get had the charge failed: the
+    period end plus grace for the regular renewal, the grace window for a dunning retry.
+    """
+    if state.status is SubStatus.ACTIVE:
+        assert state.current_period_end is not None
+        return state.current_period_end + policy.grace
+    if state.status is SubStatus.PAST_DUE:
+        assert state.grace_until is not None
+        return state.grace_until
+    raise InvalidTransition("wait for a renewal of", state.status)
+
+
+def charge_unsettled(state: SubState, *, policy: BillingPolicy) -> SubState:
+    """Stop waiting for a renewal charge that is still undecided at its deadline.
+
+    The provider kept timing out, or the charge stayed pending. No further charge is
+    scheduled: if the first one went through after all, a retry would charge twice. The grace
+    window counts from the period end, as if the charge had failed there, so the subscription
+    expires on the next pass; a late success still applies like any late payment.
+    """
+    if state.status is SubStatus.ACTIVE:
+        assert state.current_period_end is not None
+        since = state.current_period_end
+        return replace(
+            state,
+            status=SubStatus.PAST_DUE,
+            past_due_since=since,
+            grace_until=since + policy.grace,
+            dunning_attempt=state.dunning_attempt + 1,
+            next_charge_at=None,
+        )
+    if state.status is SubStatus.PAST_DUE:
+        return replace(state, next_charge_at=None)
+    raise InvalidTransition("give up a renewal of", state.status)
+
+
 def cancel(state: SubState, *, now: datetime) -> SubState:
     """Turn auto-renew off. Paid time is kept; a past-due subscription has none left."""
     if state.status is SubStatus.CANCELED:

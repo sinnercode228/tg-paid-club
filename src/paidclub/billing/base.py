@@ -60,6 +60,10 @@ class RenewalRequest:
     #: Derived from (subscription, period, attempt); the same request after a crash reuses it.
     idempotence_key: str
     description: str
+    #: When a request with this key was first sent, if this is a repeat of one whose answer
+    #: never came. A provider that forgets keys after a while (YooKassa: 24 hours) must look
+    #: the payment up instead of sending the request again once the key may be forgotten.
+    first_sent_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +102,15 @@ class PaymentFailed:
     reason: str
     for_period: int | None = None
     attempt: int | None = None
+    #: Set when the provider refused for a reason on the shop's side (credentials, a feature
+    #: not enabled for the shop) that only the owner can fix; core alerts the owner.
+    owner_note: str | None = None
+
+
+#: Failure reasons of renewals that were due but never sent to a provider: nothing was charged.
+NO_SAVED_METHOD = "no_saved_payment_method"
+PROVIDER_NOT_CONFIGURED = "provider_not_configured"
+NOT_CHARGED_REASONS = frozenset({NO_SAVED_METHOD, PROVIDER_NOT_CONFIGURED})
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +154,19 @@ class BillingProvider(Protocol):
     async def charge_renewal(self, request: RenewalRequest) -> ChargeResult:
         """Charge the saved method. Must be idempotent per ``request.idempotence_key``.
 
-        Raise :class:`ProviderError` when the outcome is unknown (timeouts, 5xx).
+        Return :class:`PaymentFailed` when the provider refused and nothing was charged
+        (a declined card, but also a request the provider rejects for good). Raise
+        :class:`ProviderError` only when the outcome is unknown (timeouts, 429, 5xx).
+        """
+        ...
+
+    async def check_payment(self, provider_payment_id: str) -> ChargeResult | None:
+        """The current state of a payment this app created: an event once the provider has
+        decided, :class:`PaymentPending` while it has not.
+
+        Used for renewal charges reported as pending and for checkouts whose notification
+        may never arrive. ``None`` when the provider cannot look this payment up. Raise
+        :class:`ProviderError` when it cannot be reached.
         """
         ...
 

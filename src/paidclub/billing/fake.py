@@ -7,7 +7,10 @@ It behaves like a real card provider where it matters:
   as YooKassa's;
 * webhooks are HMAC-signed and :meth:`FakeProvider.parse_webhook` rejects anything else;
 * renewals charge a "saved card" and are idempotent per idempotence key: the outcome is a pure
-  function of the key, so a retry after a crash gets the same payment id and the same answer.
+  function of the key, so a retry after a crash gets the same payment id and the same answer;
+* a renewal answered as pending can be looked up by its payment id
+  (:meth:`FakeProvider.check_payment`), which asks the decider again. Checkout payments cannot
+  be looked up: the payment page delivers their notification itself.
 
 Saved cards encode how renewals behave: ``fake_pm_ok_*`` always pays, ``fake_pm_decline_*``
 is always declined, which lets the demo show dunning without waiting for a random failure.
@@ -26,6 +29,7 @@ from datetime import datetime
 from typing import Any, Literal
 
 from paidclub.billing.base import (
+    NO_SAVED_METHOD,
     ChargeResult,
     Checkout,
     CheckoutRequest,
@@ -94,6 +98,9 @@ class FakeProvider:
         self._decide = decide
         #: Idempotence keys of every renewal call, in order (tests assert on retries).
         self.renewal_calls: list[str] = []
+        #: Payment ids of every :meth:`check_payment` call, in order.
+        self.checks: list[str] = []
+        self._renewals: dict[str, RenewalRequest] = {}
         self.canceled: list[int] = []
         self.resumed: list[int] = []
 
@@ -284,7 +291,16 @@ class FakeProvider:
 
     async def charge_renewal(self, request: RenewalRequest) -> ChargeResult:
         self.renewal_calls.append(request.idempotence_key)
+        return self._renewal_result(request)
+
+    async def check_payment(self, provider_payment_id: str) -> ChargeResult | None:
+        self.checks.append(provider_payment_id)
+        request = self._renewals.get(provider_payment_id)
+        return self._renewal_result(request) if request is not None else None
+
+    def _renewal_result(self, request: RenewalRequest) -> ChargeResult:
         payment_id = self.renewal_payment_id(request.idempotence_key)
+        self._renewals[payment_id] = request
         common: dict[str, Any] = {
             "provider": self.name,
             "provider_payment_id": payment_id,
@@ -296,7 +312,7 @@ class FakeProvider:
             "attempt": request.attempt,
         }
         if request.payment_method_id is None:
-            return PaymentFailed(**common, reason="no_saved_payment_method")
+            return PaymentFailed(**common, reason=NO_SAVED_METHOD)
         decision = self._decide(request) if self._decide else self._default_decision(request)
         if decision == "error":
             raise ProviderError("fake provider timeout")

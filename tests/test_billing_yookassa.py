@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from collections.abc import AsyncIterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +12,7 @@ import pytest
 from fastapi import FastAPI
 
 from paidclub import club
+from paidclub.access import decide_join_request
 from paidclub.billing import ProviderRegistry
 from paidclub.billing.base import (
     PaymentFailed,
@@ -33,7 +34,7 @@ from paidclub.payments import apply_event
 from paidclub.scheduler import Scheduler
 from paidclub.web.payments import create_webhook_router
 from tests.conftest import START
-from tests.helpers import FakeRevoker, load_sub, payments
+from tests.helpers import CHAT_ID, FakeRevoker, load_sub, notifications, payments
 
 SHOP_ID = "123456"
 SECRET = "test_secret_key"
@@ -50,19 +51,27 @@ class FakeYooKassa:
     """An in-memory YooKassa API behind ``httpx.MockTransport``.
 
     It keeps the behaviour the provider relies on: Basic auth, a required ``Idempotence-Key``
-    whose repeat returns the first answer unchanged, payments that move from pending to
-    succeeded or canceled, and 404 for unknown payments. ``script`` queues raw responses or
-    transport errors for the next requests.
+    whose repeat returns the first answer unchanged (for :attr:`key_ttl`, 24 hours as at
+    YooKassa), payments that move from pending to succeeded or canceled, 404 for unknown
+    payments, and ``GET /payments`` with ``created_at.gte``, ``limit`` and ``cursor``, newest
+    first. ``script`` queues raw responses or transport errors for the next requests.
     """
+
+    key_ttl = timedelta(hours=24)
 
     def __init__(self, clock: FakeClock) -> None:
         self.clock = clock
         self.payments: dict[str, dict[str, Any]] = {}
         self.answers: dict[str, dict[str, Any]] = {}
+        self.key_created: dict[str, datetime] = {}
         self.requests: list[httpx.Request] = []
         self.script: list[httpx.Response | Exception] = []
         #: Status a merchant-initiated (saved method) payment gets when created.
         self.renewal_status = "succeeded"
+        #: The next this many renewal POSTs create their payment, but the answer is lost.
+        self.lost_renewal_answers = 0
+        #: When set, every renewal POST gets this answer and creates nothing.
+        self.refuse_renewals: httpx.Response | None = None
         self.decline_reason = "insufficient_funds"
 
     # --- test controls ---------------------------------------------------------------------
@@ -126,8 +135,17 @@ class FakeYooKassa:
         if request.headers.get("Authorization") != expected:
             return self._error(401, "invalid_credentials", "Login or password is incorrect")
         path = request.url.path
+        renewal = request.method == "POST" and b"payment_method_id" in request.content
+        if renewal and self.refuse_renewals is not None:
+            return self.refuse_renewals
+        if renewal and self.lost_renewal_answers:
+            self.lost_renewal_answers -= 1
+            self._create(request)
+            raise httpx.ReadTimeout("answer lost after the payment was created", request=request)
         if request.method == "POST" and path == "/v3/payments":
             return self._create(request)
+        if request.method == "GET" and path == "/v3/payments":
+            return self._list(request)
         if request.method == "GET" and path.startswith("/v3/payments/"):
             payment = self.payments.get(path.rsplit("/", 1)[1])
             if payment is None:
@@ -141,8 +159,12 @@ class FakeYooKassa:
             return self._error(
                 400, "invalid_request", "Idempotence key missing", parameter="Idempotence-Key"
             )
+        created = self.key_created.get(key)
+        if created is not None and self.clock.now() - created >= self.key_ttl:
+            del self.answers[key]  # YooKassa has forgotten the key: this is a new payment
         if key in self.answers:
             return httpx.Response(200, json=self.answers[key])
+        self.key_created[key] = self.clock.now()
         body = json.loads(request.content)
         payment_id = self._new_id()
         payment: dict[str, Any] = {
@@ -179,6 +201,22 @@ class FakeYooKassa:
         self.payments[payment_id] = payment
         self.answers[key] = json.loads(json.dumps(payment))
         return httpx.Response(200, json=payment)
+
+    def _list(self, request: httpx.Request) -> httpx.Response:
+        params = request.url.params
+        since = params.get("created_at.gte")
+        limit = int(params.get("limit", "10"))
+        start = int(params.get("cursor", "0"))
+        newest_first = sorted(
+            self.payments.values(), key=lambda payment: payment["created_at"], reverse=True
+        )
+        if since is not None:
+            newest_first = [p for p in newest_first if p["created_at"] >= since]
+        page = newest_first[start : start + limit]
+        body: dict[str, Any] = {"type": "list", "items": page}
+        if start + limit < len(newest_first):
+            body["next_cursor"] = str(start + limit)
+        return httpx.Response(200, json=body)
 
 
 @pytest.fixture
@@ -581,16 +619,47 @@ async def test_a_renewal_without_a_saved_method_fails_without_calling_yookassa(
     assert api.requests == []
 
 
-async def test_wrong_credentials_surface_as_provider_errors(
+async def test_a_renewal_refused_for_wrong_credentials_is_a_failed_charge_for_the_owner(
     core: Core, api: FakeYooKassa, clock: FakeClock
 ) -> None:
+    """Only a 500 leaves the result unknown; a 401 created no payment."""
     async with httpx.AsyncClient(transport=httpx.MockTransport(api.handler)) as client:
         provider = YooKassaProvider(
             shop_id=SHOP_ID, secret_key="wrong", return_url="http://x", client=client, clock=clock
         )
+        result = await provider.charge_renewal(renewal_request())
         with pytest.raises(YooKassaError) as caught:
-            await provider.charge_renewal(renewal_request())
+            await provider.check_payment("2f000001-000f-5000-8000-000000000001")
+    assert isinstance(result, PaymentFailed)
+    assert result.provider_payment_id == f"refused:{renewal_idempotence_key(7, 2, 0)}"
+    assert result.reason == "invalid_credentials"
+    assert result.owner_note is not None
+    assert "PAIDCLUB_YOOKASSA_SECRET_KEY" in result.owner_note
     assert caught.value.status == 401
+
+
+@pytest.mark.parametrize(
+    ("status", "code", "owner_told"),
+    [(400, "invalid_request", False), (403, "forbidden", True), (404, "not_found", False)],
+)
+async def test_final_refusals_of_a_renewal_are_failed_charges(
+    api: FakeYooKassa, yookassa: YooKassaProvider, status: int, code: str, owner_told: bool
+) -> None:
+    api.script.append(FakeYooKassa._error(status, code, "refused"))
+    result = await yookassa.charge_renewal(renewal_request())
+    assert isinstance(result, PaymentFailed)
+    assert result.reason == code
+    assert (result.owner_note is not None) is owner_told
+
+
+@pytest.mark.parametrize("status", [429, 500, 502])
+async def test_answers_that_leave_the_outcome_unknown_raise(
+    api: FakeYooKassa, yookassa: YooKassaProvider, status: int
+) -> None:
+    api.script.append(FakeYooKassa._error(status, "internal_server_error", "try later"))
+    with pytest.raises(YooKassaError) as caught:
+        await yookassa.charge_renewal(renewal_request())
+    assert caught.value.status == status
 
 
 async def test_the_scheduler_renews_through_yookassa_from_the_period_end(
@@ -633,3 +702,114 @@ async def test_a_pending_renewal_settled_by_webhook_is_not_charged_again(
     assert report.charged == 0
     assert len(api.posts()) == posts_before
     assert (await load_sub(core, sub_id)).current_period_end == MAR_31
+
+
+# --- renewals whose answer never came, refusals ----------------------------------------------
+
+
+def renewal_payments(api: FakeYooKassa, sub_id: int, period: int) -> list[dict[str, Any]]:
+    return [
+        payment
+        for payment in api.payments.values()
+        if payment["metadata"].get("subscription_id") == str(sub_id)
+        and payment["metadata"].get("for_period") == str(period)
+    ]
+
+
+async def test_a_renewal_whose_answer_was_lost_is_looked_up_once_the_key_may_be_forgotten(
+    core: Core, api: FakeYooKassa, yookassa: YooKassaProvider, clock: FakeClock
+) -> None:
+    """The POST reached YooKassa and the card was charged, but the answer was lost; the
+    process was then down for more than a day, so the notification was lost too. Sending the
+    same key again would be a new payment: the payment is found in the list instead."""
+    sub_id, _ = await paid_subscription(core, api, yookassa)
+    api.lost_renewal_answers = 1
+    clock.set(FEB_28)
+    assert (await Scheduler(core, FakeRevoker()).tick()).provider_errors == 1
+
+    clock.advance(timedelta(hours=25))
+    report = await Scheduler(core, FakeRevoker()).tick()
+
+    assert report.renewed == 1
+    assert [p["status"] for p in renewal_payments(api, sub_id, 2)] == ["succeeded"]
+    assert len([r for r in api.posts() if b"payment_method_id" in r.content]) == 1
+    [search] = [r for r in api.requests if r.method == "GET" and r.url.path == "/v3/payments"]
+    assert search.url.params["created_at.gte"] == "2026-02-28T08:50:00.000Z"
+    sub = await load_sub(core, sub_id)
+    assert (sub.periods_paid, sub.current_period_end) == (2, MAR_31)
+
+
+async def test_a_renewal_that_never_reached_yookassa_is_sent_again_after_a_day(
+    core: Core, api: FakeYooKassa, yookassa: YooKassaProvider, clock: FakeClock
+) -> None:
+    sub_id, _ = await paid_subscription(core, api, yookassa)
+    clock.set(FEB_28)
+    api.script.append(httpx.ConnectError("connection refused"))
+    assert (await Scheduler(core, FakeRevoker()).tick()).provider_errors == 1
+
+    clock.advance(timedelta(hours=25))
+    assert (await Scheduler(core, FakeRevoker()).tick()).renewed == 1
+    assert [p["status"] for p in renewal_payments(api, sub_id, 2)] == ["succeeded"]
+
+
+async def test_a_search_that_cannot_finish_does_not_charge(
+    api: FakeYooKassa,
+    yookassa: YooKassaProvider,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("paidclub.billing.yookassa.SEARCH_MAX_PAGES", 2)
+    for _ in range(250):
+        api.add_foreign_payment()
+    clock.set(START + timedelta(hours=30))
+
+    with pytest.raises(YooKassaError, match="cannot tell"):
+        await yookassa.charge_renewal(renewal_request(first_sent_at=START))
+    assert api.posts() == []
+
+
+async def test_a_pending_renewal_is_checked_with_get_and_applied_when_decided(
+    core: Core, api: FakeYooKassa, yookassa: YooKassaProvider, clock: FakeClock
+) -> None:
+    sub_id, _ = await paid_subscription(core, api, yookassa)
+    api.renewal_status = "pending"
+    clock.set(FEB_28)
+    assert (await Scheduler(core, FakeRevoker()).tick()).pending == 1
+    [renewal_id] = [p["id"] for p in renewal_payments(api, sub_id, 2)]
+    posts = len(api.posts())
+
+    clock.advance(timedelta(seconds=900))
+    assert (await Scheduler(core, FakeRevoker()).tick()).pending_checked == 1
+    api.pay(renewal_id)
+    clock.advance(timedelta(seconds=900))
+    assert (await Scheduler(core, FakeRevoker()).tick()).renewed == 1
+
+    assert len(api.posts()) == posts
+    gets = [r.url.path for r in api.requests if r.method == "GET"]
+    assert gets[-2:] == [f"/v3/payments/{renewal_id}"] * 2
+    assert (await load_sub(core, sub_id)).current_period_end == MAR_31
+
+
+async def test_renewals_yookassa_refuses_for_good_go_through_dunning_and_end_access(
+    core: Core, api: FakeYooKassa, yookassa: YooKassaProvider, clock: FakeClock
+) -> None:
+    """Autopayments switched off for the shop: every renewal POST gets 403 forbidden."""
+    sub_id, _ = await paid_subscription(core, api, yookassa)
+    api.refuse_renewals = FakeYooKassa._error(
+        403, "forbidden", "Не хватает прав для совершения операции"
+    )
+    clock.set(FEB_28)
+    for _ in range(10):
+        await Scheduler(core, FakeRevoker()).tick()
+        clock.advance(timedelta(days=1))
+
+    sub = await load_sub(core, sub_id)
+    assert sub.status is SubStatus.EXPIRED
+    assert len([r for r in api.posts() if b"payment_method_id" in r.content]) == 3
+    failures = [p for p in await payments(core) if p.purpose is PaymentPurpose.RENEWAL]
+    assert {p.failure_reason for p in failures} == {"forbidden"}
+    decision = await decide_join_request(core, chat_id=CHAT_ID, telegram_id=MEMBER)
+    assert decision.action == "decline"
+    alerts = await notifications(core, "owner_alert")
+    assert len(alerts) == 3  # at most once a day: Feb 28, Mar 1 and Mar 3
+    assert all("менеджер ЮKassa" in alert.text for alert in alerts)

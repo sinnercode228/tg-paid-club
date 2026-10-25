@@ -136,6 +136,9 @@ class StubStarsProvider:
     async def charge_renewal(self, request: RenewalRequest) -> ChargeResult:
         raise AssertionError("Telegram renews Stars subscriptions itself")
 
+    async def check_payment(self, provider_payment_id: str) -> ChargeResult | None:
+        return None
+
     async def parse_webhook(
         self, headers: Mapping[str, str], body: bytes
     ) -> Sequence[PaymentSucceeded | PaymentFailed]:

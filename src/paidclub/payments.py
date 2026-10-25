@@ -120,6 +120,16 @@ async def apply_payment_event(
         )
         session.add(payment)
 
+    if isinstance(event, PaymentFailed) and event.owner_note:
+        # The shop's own problem (credentials, permissions): once a day is enough.
+        await alert_owner(
+            session,
+            core,
+            key=f"owner:provider:{event.provider}:{event.reason}:{now:%Y-%m-%d}",
+            text=f"Провайдер {event.provider} отклонил списание ({event.reason}). "
+            f"{event.owner_note} Пока это не исправлено, продления не проходят.",
+        )
+
     sub = None
     if event.subscription_id is not None:
         sub = await session.get(Subscription, event.subscription_id, populate_existing=True)
@@ -127,7 +137,7 @@ async def apply_payment_event(
         payment.outcome = PaymentOutcome.UNKNOWN_SUBSCRIPTION
         await session.flush()
         if succeeded:
-            await _alert_owner(
+            await alert_owner(
                 session,
                 core,
                 key=f"owner:unknown_sub:{event.provider}:{event.provider_payment_id}",
@@ -176,7 +186,7 @@ async def _apply_success(
     expected = price_of(sub)
     ref = f"{event.provider} {event.provider_payment_id}"
     if event.amount != expected:
-        await _alert_owner(
+        await alert_owner(
             session,
             core,
             key=f"owner:amount:{event.provider}:{event.provider_payment_id}",
@@ -210,7 +220,7 @@ async def _apply_success(
             problem = f"у участника уже есть действующая подписка #{other.id}"
     if problem is not None:
         payment.for_period = event.for_period
-        await _alert_owner(
+        await alert_owner(
             session,
             core,
             key=f"owner:refund:{event.provider}:{event.provider_payment_id}",
@@ -235,7 +245,7 @@ async def _apply_success(
         # A renewal charge from before a cancel that settled only after the period it pays
         # for was over: there is no time left to give the member.
         payment.for_period = state.periods_paid
-        await _alert_owner(
+        await alert_owner(
             session,
             core,
             key=f"owner:refund:{event.provider}:{event.provider_payment_id}",
@@ -352,7 +362,8 @@ async def notify_renewal_failed(
     )
 
 
-async def _alert_owner(session: AsyncSession, core: Core, *, key: str, text: str) -> None:
+async def alert_owner(session: AsyncSession, core: Core, *, key: str, text: str) -> None:
+    """Queue a message to the owner in the caller's transaction (logged in any case)."""
     log.warning("owner alert: %s", text)
     owner_id = core.settings.owner_id
     if owner_id is None:

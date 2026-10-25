@@ -177,6 +177,10 @@ class StarsProvider:
     async def charge_renewal(self, request: RenewalRequest) -> ChargeResult:
         raise ProviderError("Telegram charges Stars renewals itself; there is nothing to charge")
 
+    async def check_payment(self, provider_payment_id: str) -> ChargeResult | None:
+        """The Bot API cannot look payments up; they arrive as updates."""
+        return None
+
     async def parse_webhook(
         self, headers: Mapping[str, str], body: bytes
     ) -> Sequence[PaymentSucceeded | PaymentFailed]:

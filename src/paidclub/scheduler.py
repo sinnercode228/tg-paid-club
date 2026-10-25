@@ -10,10 +10,20 @@ A tick does, in this order:
    :func:`paidclub.payments.apply_payment_event` like any webhook. Provider-renewed
    subscriptions (Stars) are not charged: if the renewal payment has not arrived by
    ``next_charge_at`` they go past due without retries.
-2. **Expiry.** Past-due subscriptions whose grace window closed (and that have no retry due)
+
+   A charge whose outcome stays unknown (the provider keeps timing out) is repeated with the
+   same key, and the owner is told after :data:`ALERT_AFTER_CALLS` tries. At the end of the
+   grace period the member would have had if it had failed, the subscription stops waiting
+   for it (:func:`~paidclub.domain.subscriptions.charge_unsettled`): no retry is charged, and
+   access ends like after a failed renewal.
+2. **Pending charges.** A charge the provider reported as pending is looked up by its payment
+   id every ``pending_recheck_seconds`` until the provider decides, then applied. This runs
+   for the charge, not the subscription, so a charge that settles after the member cancelled
+   is still recorded.
+3. **Expiry.** Past-due subscriptions whose grace window closed (and that have no retry due)
    and canceled subscriptions whose paid period ended become ``expired``.
-3. **Access.** Members of expired subscriptions are removed from the club chats.
-4. **Reminders.** Before a renewal or the end of access, at each configured offset.
+4. **Access.** Members of expired subscriptions are removed from the club chats.
+5. **Reminders.** Before a renewal or the end of access, at each configured offset.
 
 Renewals run before expiry on purpose: a last retry scheduled exactly at the end of the grace
 window gets its chance before the subscription expires.
@@ -34,6 +44,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from paidclub import texts
 from paidclub.access import AccessRevoker, revoke_expired_access
 from paidclub.billing.base import (
+    PROVIDER_NOT_CONFIGURED,
     ChargeResult,
     PaymentFailed,
     PaymentPending,
@@ -46,12 +57,16 @@ from paidclub.domain import subscriptions as domain
 from paidclub.domain.subscriptions import RenewalMode, SubStatus
 from paidclub.models import ChargeAttempt, ChargeAttemptStatus, PaymentOutcome, Subscription
 from paidclub.notifications import MessageDraft, enqueue
-from paidclub.payments import apply_payment_event, notify_renewal_failed
+from paidclub.payments import alert_owner, apply_payment_event, notify_renewal_failed
 from paidclub.repo import price_of, state_of, write_state
 
 log = logging.getLogger(__name__)
 
 _APPLIED = PaymentOutcome.APPLIED
+#: The owner is told once a charge has been tried this many times without an answer.
+ALERT_AFTER_CALLS = 3
+#: However early the deadline, an undecided charge gets at least this long.
+UNSETTLED_PATIENCE = timedelta(hours=6)
 
 
 @dataclass
@@ -61,6 +76,10 @@ class TickReport:
     charge_failed: int = 0
     pending: int = 0
     provider_errors: int = 0
+    #: Pending charges looked up at the provider.
+    pending_checked: int = 0
+    #: Renewals whose charge stayed undecided until its deadline.
+    unsettled: int = 0
     renewals_missing: int = 0
     expired: int = 0
     removed: int = 0
@@ -95,7 +114,13 @@ class Scheduler:
 
     async def tick(self) -> TickReport:
         report = TickReport()
-        for step in (self._renewals, self._expire, self._revoke, self._remind):
+        for step in (
+            self._renewals,
+            self._pending_charges,
+            self._expire,
+            self._revoke,
+            self._remind,
+        ):
             try:
                 await step(report)
             except Exception:
@@ -184,6 +209,16 @@ class Scheduler:
                     select(ChargeAttempt).where(ChargeAttempt.idempotence_key == key)
                 )
             ).one_or_none()
+            if row is not None and (row.calls > 0 or row.status is not ChargeAttemptStatus.STARTED):
+                # An earlier request for this charge has not moved the subscription on.
+                deadline = max(
+                    domain.renewal_deadline(state_of(sub), core.policy),
+                    row.created_at + UNSETTLED_PATIENCE,
+                )
+                if now >= deadline:
+                    await self._give_up(session, sub, row, now)
+                    report.unsettled += 1
+                    return None
             if row is None:
                 row = ChargeAttempt(
                     subscription_id=sub.id,
@@ -196,6 +231,16 @@ class Scheduler:
                     updated_at=now,
                 )
                 session.add(row)
+            elif row.status is ChargeAttemptStatus.PENDING:
+                # The provider has the charge and has not decided; step 2 asks it, so the
+                # request is not sent again.
+                if row.next_check_at is None:
+                    row.next_check_at = now
+                sub.claim_token = None
+                sub.claimed_until = max(
+                    row.next_check_at, now + timedelta(seconds=core.settings.provider_retry_seconds)
+                )
+                return None
             elif row.status in (ChargeAttemptStatus.SUCCEEDED, ChargeAttemptStatus.FAILED):
                 # The provider already answered this exact request, but the answer did not
                 # move the subscription (an amount mismatch, say; the owner has been alerted).
@@ -210,6 +255,7 @@ class Scheduler:
                 sub.claim_token = None
                 sub.claimed_until = now + timedelta(seconds=core.settings.provider_retry_seconds)
                 return None
+            first_sent_at = row.created_at if row.calls > 0 else None
             row.calls += 1
             row.updated_at = now
             await session.flush()
@@ -227,6 +273,7 @@ class Scheduler:
                     payment_method_id=sub.payment_method_id,
                     idempotence_key=key,
                     description=f"Продление подписки «{plan.title if plan else sub.plan_code}»",
+                    first_sent_at=first_sent_at,
                 ),
             )
 
@@ -247,7 +294,7 @@ class Scheduler:
                 amount=request.amount,
                 occurred_at=core.clock.now(),
                 purpose=PaymentPurpose.RENEWAL,
-                reason="provider_not_configured",
+                reason=PROVIDER_NOT_CONFIGURED,
                 for_period=request.for_period,
                 attempt=request.attempt,
             )
@@ -259,7 +306,9 @@ class Scheduler:
                 # with the same idempotence key.
                 report.provider_errors += 1
                 log.warning("charge for subscription %s: %s", sub_id, exc)
-                await self._record_attempt_error(charge.attempt_id, f"{type(exc).__name__}: {exc}")
+                await self._record_attempt_error(
+                    charge.attempt_id, request, f"{type(exc).__name__}: {exc}"
+                )
                 await self._release(sub_id, token, backoff=True)
                 return
 
@@ -272,6 +321,7 @@ class Scheduler:
             if isinstance(result, PaymentPending):
                 attempt.status = ChargeAttemptStatus.PENDING
                 recheck = now + timedelta(seconds=core.settings.pending_recheck_seconds)
+                attempt.next_check_at = recheck
                 await release(session, Subscription, sub_id, token, until=recheck)
                 return None
             await session.flush()
@@ -296,15 +346,141 @@ class Scheduler:
         else:
             report.renewed += 1
 
-    async def _record_attempt_error(self, attempt_id: int, error: str) -> None:
-        async with self.core.sessions() as session, session.begin():
-            await session.execute(
-                update(ChargeAttempt)
-                .where(ChargeAttempt.id == attempt_id)
-                .values(last_error=error[:2000], updated_at=self.core.clock.now())
-            )
+    async def _record_attempt_error(
+        self, attempt_id: int, request: RenewalRequest, error: str
+    ) -> None:
+        core = self.core
+        async with core.sessions() as session, session.begin():
+            row = await session.get(ChargeAttempt, attempt_id, populate_existing=True)
+            if row is None:  # pragma: no cover - rows are never deleted
+                return
+            row.last_error = error[:2000]
+            row.updated_at = core.clock.now()
+            if row.calls >= ALERT_AFTER_CALLS:
+                await alert_owner(
+                    session,
+                    core,
+                    key=f"owner:charge_errors:{request.idempotence_key}",
+                    text=f"Списание за продление подписки #{request.subscription_id} "
+                    f"({request.amount.human()}) не получило ответа {row.calls} раза подряд: "
+                    f"{error[:300]}. Повторы идут с тем же ключом идемпотентности "
+                    f"{request.idempotence_key}, двойного списания не будет.",
+                )
 
-    # --- 2. expiry -------------------------------------------------------------------------
+    async def _give_up(
+        self, session: AsyncSession, sub: Subscription, row: ChargeAttempt, now: datetime
+    ) -> None:
+        """The charge in ``row`` is still undecided at its deadline: stop waiting for it."""
+        core = self.core
+        write_state(sub, domain.charge_unsettled(state_of(sub), policy=core.policy), now=now)
+        sub.claim_token, sub.claimed_until = None, None
+        row.last_error = (row.last_error or "") + " | no answer by the deadline"
+        row.updated_at = now
+        log.error(
+            "subscription %s: charge %s (%s) still undecided, access ends like after a failure",
+            sub.id,
+            row.idempotence_key,
+            row.status.value,
+        )
+        await alert_owner(
+            session,
+            core,
+            key=f"owner:unsettled:{row.idempotence_key}",
+            text=f"Списание за продление подписки #{sub.id} (участник {sub.member.telegram_id}, "
+            f"{price_of(sub).human()}) так и не получило ответа от {sub.provider} "
+            f"(ключ {row.idempotence_key}). Новых попыток не будет, доступ закончится как "
+            "после неудачного списания. Проверьте платёж в личном кабинете провайдера: если "
+            "деньги списаны, придёт уведомление и подписка восстановится.",
+        )
+
+    # --- 2. pending charges ----------------------------------------------------------------
+
+    async def _pending_charges(self, report: TickReport) -> None:
+        core = self.core
+        for _ in range(self.max_batches):
+            now = core.clock.now()
+            async with core.sessions() as session:
+                ids = list(
+                    (
+                        await session.scalars(
+                            select(ChargeAttempt.id)
+                            .where(
+                                ChargeAttempt.status == ChargeAttemptStatus.PENDING,
+                                ChargeAttempt.provider_payment_id.is_not(None),
+                                ChargeAttempt.next_check_at <= now,
+                            )
+                            .order_by(ChargeAttempt.next_check_at)
+                            .limit(self.batch_size)
+                        )
+                    ).all()
+                )
+            if not ids:
+                return
+            for attempt_id in ids:
+                try:
+                    await self._check_pending(attempt_id, report)
+                except Exception:
+                    report.errors += 1
+                    log.exception("checking pending charge %s failed", attempt_id)
+
+    async def _check_pending(self, attempt_id: int, report: TickReport) -> None:
+        core = self.core
+        now = core.clock.now()
+        recheck = now + timedelta(seconds=core.settings.pending_recheck_seconds)
+        async with core.sessions() as session, session.begin():
+            # Moving next_check_at is the claim: a second worker's update matches nothing.
+            claimed = await session.execute(
+                update(ChargeAttempt)
+                .where(
+                    ChargeAttempt.id == attempt_id,
+                    ChargeAttempt.status == ChargeAttemptStatus.PENDING,
+                    ChargeAttempt.next_check_at <= now,
+                )
+                .values(next_check_at=recheck)
+            )
+            if claimed.rowcount != 1:  # type: ignore[attr-defined]
+                return
+            row = await session.get(ChargeAttempt, attempt_id)
+            assert row is not None
+            assert row.provider_payment_id is not None
+            sub = await session.get(Subscription, row.subscription_id)
+            assert sub is not None
+            provider_name, payment_id = sub.provider, row.provider_payment_id
+        provider = core.providers.get(provider_name)
+        if provider is None:
+            log.warning("pending charge %s: provider %s is not enabled", payment_id, provider_name)
+            return
+        try:
+            result = await provider.check_payment(payment_id)
+        except Exception as exc:
+            report.provider_errors += 1
+            log.warning("checking pending charge %s: %s", payment_id, exc)
+            return
+        report.pending_checked += 1
+        if result is None:
+            # The provider cannot look it up; only its notification can settle it.
+            async with core.sessions() as session, session.begin():
+                await session.execute(
+                    update(ChargeAttempt)
+                    .where(ChargeAttempt.id == attempt_id)
+                    .values(next_check_at=None)
+                )
+            return
+        if isinstance(result, PaymentPending):
+            return
+
+        async def apply(session: AsyncSession) -> PaymentOutcome:
+            return (await apply_payment_event(session, result, core)).outcome
+
+        outcome = await in_transaction(core.sessions, apply)
+        log.info("pending charge %s settled: %s", payment_id, outcome.value)
+        if outcome is _APPLIED:
+            if isinstance(result, PaymentFailed):
+                report.charge_failed += 1
+            else:
+                report.renewed += 1
+
+    # --- 3. expiry -------------------------------------------------------------------------
 
     async def _expire(self, report: TickReport) -> None:
         core = self.core
@@ -363,7 +539,7 @@ class Scheduler:
 
         return work
 
-    # --- 3. access -------------------------------------------------------------------------
+    # --- 4. access -------------------------------------------------------------------------
 
     async def _revoke(self, report: TickReport) -> None:
         result = await revoke_expired_access(
@@ -372,7 +548,7 @@ class Scheduler:
         report.removed += result.removed
         report.revoke_errors += result.errors
 
-    # --- 4. reminders ----------------------------------------------------------------------
+    # --- 5. reminders ----------------------------------------------------------------------
 
     async def _remind(self, report: TickReport) -> None:
         core = self.core

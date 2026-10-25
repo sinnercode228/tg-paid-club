@@ -304,7 +304,9 @@ class ChargeAttemptStatus(StrEnum):
 
 class ChargeAttempt(Base):
     """One merchant-initiated renewal charge. Written before the provider call, so a crash
-    mid-charge is retried with the same idempotence key instead of charging twice."""
+    mid-charge is retried with the same idempotence key instead of charging twice. A charge
+    the provider reports as pending is looked up by its payment id until it is decided, even
+    if the subscription has moved on meanwhile (the member cancelled)."""
 
     __tablename__ = "charge_attempts"
 
@@ -317,11 +319,14 @@ class ChargeAttempt(Base):
     provider_payment_id: Mapped[str | None] = mapped_column(String(128), index=True)
     calls: Mapped[int] = mapped_column(default=0)
     last_error: Mapped[str | None] = mapped_column(Text)
+    #: For a pending charge: when to ask the provider for its decision again.
+    next_check_at: Mapped[datetime | None]
     created_at: Mapped[datetime]
     updated_at: Mapped[datetime]
 
     __table_args__ = (
         UniqueConstraint("subscription_id", "for_period", "attempt", name="uq_charge_attempt"),
+        Index("ix_charge_attempts_pending", "status", "next_check_at"),
     )
 
 

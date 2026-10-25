@@ -363,20 +363,119 @@ async def test_a_pending_charge_is_settled_by_the_webhook(
     assert (await load_sub(core, sub_id)).current_period_end == MAR_31
 
 
-async def test_a_charge_still_pending_after_the_recheck_is_asked_again_with_the_same_key(
+async def test_a_pending_charge_is_looked_up_by_its_payment_id_not_sent_again(
     core_with_decider: CoreFactory, clock: FakeClock, revoker: FakeRevoker
 ) -> None:
-    core = await core_with_decider(lambda request: "pending")
+    decision: list[Decision] = ["pending"]
+    core = await core_with_decider(lambda request: decision[0])
     fake = fake_of(core)
     sub_id = await subscribe(core, fake, MEMBER)
     clock.set(FEB_28)
     await tick(core, revoker)
-    clock.advance(timedelta(seconds=900))
-    assert (await tick(core, revoker)).pending == 1
     key = renewal_idempotence_key(sub_id, 2, 0)
-    assert fake.renewal_calls == [key, key]
+    payment_id = fake.renewal_payment_id(key)
+
+    clock.advance(timedelta(seconds=900))
+    report = await tick(core, revoker)
+    assert (report.charged, report.pending_checked) == (0, 1)
+    assert fake.checks == [payment_id]
     [attempt] = await attempts(core)
-    assert attempt.calls == 2
+    assert (attempt.status, attempt.next_check_at) == (
+        ChargeAttemptStatus.PENDING,
+        FEB_28 + timedelta(seconds=1800),
+    )
+
+    decision[0] = "succeeded"
+    clock.advance(timedelta(seconds=900))
+    report = await tick(core, revoker)
+    assert (report.pending_checked, report.renewed) == (1, 1)
+    assert fake.renewal_calls == [key]  # the charge itself was sent once
+    [attempt] = await attempts(core)
+    assert attempt.status is ChargeAttemptStatus.SUCCEEDED
+    sub = await load_sub(core, sub_id)
+    assert (sub.status, sub.current_period_end) == (SubStatus.ACTIVE, MAR_31)
+
+
+async def test_a_pending_charge_is_still_settled_after_the_member_cancelled(
+    core_with_decider: CoreFactory, clock: FakeClock, revoker: FakeRevoker
+) -> None:
+    decision: list[Decision] = ["pending"]
+    core = await core_with_decider(lambda request: decision[0])
+    fake = fake_of(core)
+    sub_id = await subscribe(core, fake, MEMBER)
+    clock.set(FEB_28)
+    await tick(core, revoker)
+    await club.cancel(core, telegram_id=MEMBER, subscription_id=sub_id)
+    clock.advance(timedelta(minutes=1))
+    assert (await tick(core, revoker)).expired == 1
+
+    decision[0] = "succeeded"
+    clock.advance(timedelta(seconds=900))
+    assert (await tick(core, revoker)).renewed == 1
+
+    sub = await load_sub(core, sub_id)
+    assert (sub.status, sub.next_charge_at, sub.current_period_end) == (
+        SubStatus.CANCELED,
+        None,
+        MAR_31,
+    )
+
+
+async def test_a_charge_that_never_gets_an_answer_alerts_the_owner_and_ends_with_grace(
+    core_with_decider: CoreFactory, clock: FakeClock, revoker: FakeRevoker
+) -> None:
+    core = await core_with_decider(lambda request: "error")
+    fake = fake_of(core)
+    sub_id = await subscribe(core, fake, MEMBER)
+    key = renewal_idempotence_key(sub_id, 2, 0)
+
+    clock.set(FEB_28)
+    for _ in range(3):
+        assert (await tick(core, revoker)).provider_errors == 1
+        clock.advance(timedelta(seconds=300))
+    [alert] = await notifications(core, "owner_alert")
+    assert key in alert.text
+    assert fake.renewal_calls == [key, key, key]
+
+    # Until the grace period a failure would have given is over, the member keeps access
+    # and the same request is repeated; then the subscription stops waiting for it.
+    clock.set(FEB_28 + 3 * DAY - timedelta(minutes=1))
+    assert (await tick(core, revoker)).provider_errors == 1
+    clock.set(FEB_28 + 3 * DAY + timedelta(minutes=4))  # the last error's backoff runs out
+    report = await tick(core, revoker)
+    assert (report.unsettled, report.charged, report.expired) == (1, 0, 1)
+    assert set(fake.renewal_calls) == {key}
+    sub = await load_sub(core, sub_id)
+    assert (sub.status, sub.expire_reason) == (SubStatus.EXPIRED, ExpireReason.PAYMENT_FAILED)
+    assert await status_log(core, sub_id) == [
+        (None, "pending", None),
+        ("pending", "active", None),
+        ("active", "past_due", None),
+        ("past_due", "expired", "payment_failed"),
+    ]
+    assert any(key in n.text and "так и не получило" in n.text for n in await notifications(core))
+    decision = await decide_join_request(core, chat_id=CHAT_ID, telegram_id=MEMBER)
+    assert decision.action == "decline"
+
+
+async def test_an_unanswered_last_retry_gets_some_time_before_access_ends(
+    core_with_decider: CoreFactory, clock: FakeClock, revoker: FakeRevoker
+) -> None:
+    def decide(request: RenewalRequest) -> Decision:
+        return "error" if request.attempt == 2 else "failed"
+
+    core = await core_with_decider(decide)
+    sub_id = await subscribe(core, fake_of(core), MEMBER)
+    for moment in (FEB_28, FEB_28 + DAY, FEB_28 + 3 * DAY):
+        clock.set(moment)
+        await tick(core, revoker)
+    assert (await load_sub(core, sub_id)).status is SubStatus.PAST_DUE
+
+    clock.set(FEB_28 + 3 * DAY + timedelta(hours=5))
+    assert (await tick(core, revoker)).expired == 0
+    clock.set(FEB_28 + 3 * DAY + timedelta(hours=6))
+    report = await tick(core, revoker)
+    assert (report.unsettled, report.expired) == (1, 1)
 
 
 async def test_two_workers_charge_each_renewal_exactly_once(
