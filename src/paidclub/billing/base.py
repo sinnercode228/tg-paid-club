@@ -121,8 +121,23 @@ class PaymentPending:
     provider_payment_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class PaymentRefunded:
+    """Money of a payment went back to the member, all of it or a part (YooKassa
+    ``refund.succeeded``, made by the owner in the shop's dashboard)."""
+
+    provider: str
+    #: The payment that was refunded.
+    provider_payment_id: str
+    refund_id: str
+    amount: Money
+    occurred_at: datetime
+
+
 BillingEvent = PaymentSucceeded | PaymentFailed
 ChargeResult = PaymentSucceeded | PaymentFailed | PaymentPending
+#: What a notification can report.
+WebhookEvent = PaymentSucceeded | PaymentFailed | PaymentRefunded
 
 
 class WebhookRejected(Exception):
@@ -172,7 +187,7 @@ class BillingProvider(Protocol):
 
     async def parse_webhook(
         self, headers: Mapping[str, str], body: bytes
-    ) -> Sequence[PaymentSucceeded | PaymentFailed]:
+    ) -> Sequence[WebhookEvent]:
         """Verify and parse a notification. Return ``[]`` for events we ignore.
 
         Raise :class:`WebhookRejected` when it cannot be verified.

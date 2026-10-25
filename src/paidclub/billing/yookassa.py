@@ -24,6 +24,9 @@ How the API is used (https://yookassa.ru/developers):
 * **Webhooks are not signed.** The body is only trusted for the payment id. The payment is
   then fetched with the shop credentials, and the status of that fetched object is what gets
   applied. A forged notification can at most make us look up a real payment.
+* **Refunds.** The owner refunds in the shop's dashboard; ``refund.succeeded`` is confirmed
+  with ``GET /refunds/{id}`` the same way and turns the subscription's auto-renew off (see
+  :func:`paidclub.payments.apply_refund`).
 
 Payments carry our ``metadata`` (subscription, period, attempt, purpose) and a ``paidclub``
 marker. Payments without the marker were not created by this app (the shop may sell other
@@ -51,10 +54,12 @@ from paidclub.billing.base import (
     PaymentFailed,
     PaymentPending,
     PaymentPurpose,
+    PaymentRefunded,
     PaymentSucceeded,
     ProviderError,
     ProviderSubscriptionRef,
     RenewalRequest,
+    WebhookEvent,
     WebhookRejected,
 )
 from paidclub.clock import Clock, SystemClock, ensure_utc
@@ -475,7 +480,7 @@ class YooKassaProvider:
 
     async def parse_webhook(
         self, headers: Mapping[str, str], body: bytes
-    ) -> Sequence[PaymentSucceeded | PaymentFailed]:
+    ) -> Sequence[WebhookEvent]:
         try:
             data = json.loads(body)
         except ValueError as exc:
@@ -485,6 +490,8 @@ class YooKassaProvider:
         event_name, obj = data.get("event"), data.get("object")
         if not isinstance(event_name, str) or not isinstance(obj, dict):
             raise WebhookRejected("YooKassa notification without event or object")
+        if event_name == "refund.succeeded":
+            return await self._refund_events(obj)
         if not event_name.startswith("payment."):
             log.info("ignoring YooKassa %s notification", event_name)
             return []
@@ -510,6 +517,35 @@ class YooKassaProvider:
             )
             return []
         return [event]
+
+    async def _refund_events(self, obj: Mapping[str, Any]) -> list[WebhookEvent]:
+        """A refund, confirmed by fetching it with the shop credentials like a payment."""
+        refund_id = obj.get("id")
+        if not isinstance(refund_id, str) or not _PAYMENT_ID.match(refund_id):
+            raise WebhookRejected("YooKassa refund notification without a valid refund id")
+        try:
+            refund = await self._request("GET", f"/refunds/{refund_id}")
+        except YooKassaError as exc:
+            if exc.status == 404:
+                raise WebhookRejected(f"YooKassa has no refund {refund_id}") from exc
+            raise
+        if refund.get("status") != "succeeded":
+            log.info("YooKassa refund %s is %s: nothing to do", refund_id, refund.get("status"))
+            return []
+        try:
+            amount = refund["amount"]
+            created_at = _parse_time(refund.get("created_at"))
+            return [
+                PaymentRefunded(
+                    provider=self.name,
+                    provider_payment_id=str(refund["payment_id"]),
+                    refund_id=str(refund["id"]),
+                    amount=Money.from_decimal(str(amount["value"]), str(amount["currency"])),
+                    occurred_at=created_at or self._clock.now(),
+                )
+            ]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise YooKassaError(f"malformed YooKassa refund {refund_id}: {exc}") from exc
 
     async def cancel(self, ref: ProviderSubscriptionRef) -> None:
         """Nothing to do: YooKassa has no subscription, renewals are our own charges."""

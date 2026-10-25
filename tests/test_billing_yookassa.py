@@ -18,6 +18,7 @@ from paidclub.billing.base import (
     PaymentFailed,
     PaymentPending,
     PaymentPurpose,
+    PaymentRefunded,
     PaymentSucceeded,
     ProviderError,
     RenewalRequest,
@@ -27,12 +28,12 @@ from paidclub.billing.yookassa import YooKassaError, YooKassaProvider
 from paidclub.clock import FakeClock
 from paidclub.config import Settings
 from paidclub.container import Core, build_core
-from paidclub.domain.subscriptions import SubStatus, renewal_idempotence_key
+from paidclub.domain.subscriptions import ExpireReason, SubStatus, renewal_idempotence_key
 from paidclub.models import PaymentOutcome
 from paidclub.money import Money
 from paidclub.payments import apply_event
 from paidclub.scheduler import Scheduler
-from paidclub.web.payments import create_webhook_router
+from paidclub.web.payments import create_webhook_router, process_webhook
 from tests.conftest import START
 from tests.helpers import CHAT_ID, FakeRevoker, load_sub, notifications, payments
 
@@ -62,6 +63,7 @@ class FakeYooKassa:
     def __init__(self, clock: FakeClock) -> None:
         self.clock = clock
         self.payments: dict[str, dict[str, Any]] = {}
+        self.refunds: dict[str, dict[str, Any]] = {}
         self.answers: dict[str, dict[str, Any]] = {}
         self.key_created: dict[str, datetime] = {}
         self.requests: list[httpx.Request] = []
@@ -92,6 +94,25 @@ class FakeYooKassa:
         payment = self.payments[payment_id]
         payment["status"] = "canceled"
         payment["cancellation_details"] = {"party": "payment_network", "reason": reason}
+
+    def refund(self, payment_id: str, value: str | None = None) -> str:
+        """The owner refunds (part of) a payment in the shop's dashboard."""
+        payment = self.payments[payment_id]
+        refund_id = f"2f{len(self.refunds) + 1:06x}-0015-5000-9000-{len(self.refunds) + 1:012x}"
+        self.refunds[refund_id] = {
+            "id": refund_id,
+            "payment_id": payment_id,
+            "status": "succeeded",
+            "created_at": _iso(self.clock.now()),
+            "amount": {"value": value or payment["amount"]["value"], "currency": "RUB"},
+        }
+        return refund_id
+
+    def refund_notification(self, refund_id: str) -> bytes:
+        stored = self.refunds[refund_id]
+        return json.dumps(
+            {"type": "notification", "event": "refund.succeeded", "object": dict(stored)}
+        ).encode()
 
     def add_foreign_payment(self) -> str:
         """A payment of the same shop that this app did not create (no marker)."""
@@ -146,6 +167,11 @@ class FakeYooKassa:
             return self._create(request)
         if request.method == "GET" and path == "/v3/payments":
             return self._list(request)
+        if request.method == "GET" and path.startswith("/v3/refunds/"):
+            refund = self.refunds.get(path.rsplit("/", 1)[1])
+            if refund is None:
+                return self._error(404, "not_found", "Refund not found")
+            return httpx.Response(200, json=refund)
         if request.method == "GET" and path.startswith("/v3/payments/"):
             payment = self.payments.get(path.rsplit("/", 1)[1])
             if payment is None:
@@ -489,17 +515,17 @@ async def test_the_webhook_asks_for_a_retry_while_the_api_cannot_confirm(
     assert (await load_sub(core, sub_id)).status is SubStatus.ACTIVE
 
 
-async def test_foreign_payments_and_refund_events_are_ignored(
+async def test_foreign_payments_and_other_events_are_ignored(
     api: FakeYooKassa, yookassa: YooKassaProvider
 ) -> None:
     foreign = api.add_foreign_payment()
     assert await yookassa.parse_webhook({}, api.notification(foreign)) == []
 
-    refund = json.dumps(
-        {"type": "notification", "event": "refund.succeeded", "object": {"id": "refund-1"}}
+    method = json.dumps(
+        {"type": "notification", "event": "payment_method.active", "object": {"id": "pm-1"}}
     ).encode()
     before = len(api.requests)
-    assert await yookassa.parse_webhook({}, refund) == []
+    assert await yookassa.parse_webhook({}, method) == []
     assert len(api.requests) == before
 
 
@@ -813,3 +839,82 @@ async def test_renewals_yookassa_refuses_for_good_go_through_dunning_and_end_acc
     alerts = await notifications(core, "owner_alert")
     assert len(alerts) == 3  # at most once a day: Feb 28, Mar 1 and Mar 3
     assert all("менеджер ЮKassa" in alert.text for alert in alerts)
+
+
+# --- refunds ---------------------------------------------------------------------------------
+
+
+async def test_a_refund_turns_auto_renew_off_and_forgets_the_card(
+    core: Core,
+    api: FakeYooKassa,
+    yookassa: YooKassaProvider,
+    clock: FakeClock,
+    http: httpx.AsyncClient,
+) -> None:
+    sub_id, payment_id = await paid_subscription(core, api, yookassa)
+    refund_id = api.refund(payment_id)
+
+    forged = json.dumps(
+        {
+            "type": "notification",
+            "event": "refund.succeeded",
+            "object": {"id": refund_id, "payment_id": "someone-else", "status": "succeeded"},
+        }
+    ).encode()
+    response = await http.post("/webhooks/yookassa", content=forged)
+    assert response.status_code == 200
+    assert response.json()["results"] == [{"outcome": "applied", "subscription_id": sub_id}]
+    # The refund was fetched with the shop credentials; the body's payment id is not trusted.
+    assert api.requests[-1].url.path == f"/v3/refunds/{refund_id}"
+    again = await http.post("/webhooks/yookassa", content=api.refund_notification(refund_id))
+    assert again.json()["results"][0]["outcome"] == "duplicate"
+
+    sub = await load_sub(core, sub_id)
+    assert (sub.status, sub.payment_method_id, sub.next_charge_at) == (
+        SubStatus.CANCELED,
+        None,
+        None,
+    )
+    [member] = await notifications(core, "refunded")
+    assert "990 ₽" in member.text and "сохранится до 28.02.2026" in member.text
+    [alert] = await notifications(core, "owner_alert")
+    assert "отключено автопродление" in alert.text
+
+    before = len(api.posts())
+    clock.set(FEB_28)
+    await Scheduler(core, FakeRevoker()).tick()
+    assert len(api.posts()) == before
+    assert (await load_sub(core, sub_id)).status is SubStatus.EXPIRED
+
+
+async def test_a_refund_while_past_due_ends_access_and_stops_the_retries(
+    core: Core, api: FakeYooKassa, yookassa: YooKassaProvider, clock: FakeClock
+) -> None:
+    sub_id, payment_id = await paid_subscription(core, api, yookassa)
+    api.renewal_status = "canceled"
+    clock.set(FEB_28)
+    await Scheduler(core, FakeRevoker()).tick()
+    assert (await load_sub(core, sub_id)).status is SubStatus.PAST_DUE
+
+    refund_id = api.refund(payment_id, "500.00")  # a part of it
+    [event] = await yookassa.parse_webhook({}, api.refund_notification(refund_id))
+    assert isinstance(event, PaymentRefunded)
+    assert (event.provider_payment_id, event.amount) == (payment_id, Money(50000, "RUB"))
+    [result] = await process_webhook(core, "yookassa", {}, api.refund_notification(refund_id))
+    assert result.outcome is PaymentOutcome.APPLIED
+
+    sub = await load_sub(core, sub_id)
+    assert (sub.status, sub.expire_reason) == (SubStatus.EXPIRED, ExpireReason.CANCELED)
+    posts = len(api.posts())
+    clock.set(FEB_28 + timedelta(days=1))
+    await Scheduler(core, FakeRevoker()).tick()
+    assert len(api.posts()) == posts
+
+
+async def test_a_refund_of_a_payment_this_app_did_not_make_is_only_recorded(
+    core: Core, api: FakeYooKassa, yookassa: YooKassaProvider
+) -> None:
+    refund_id = api.refund(api.add_foreign_payment())
+    [result] = await process_webhook(core, "yookassa", {}, api.refund_notification(refund_id))
+    assert (result.outcome, result.subscription_id) == (PaymentOutcome.RECORDED, None)
+    assert await notifications(core) == []

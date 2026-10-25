@@ -43,12 +43,12 @@ from paidclub.billing.base import (
     ChargeResult,
     Checkout,
     CheckoutRequest,
-    PaymentFailed,
     PaymentPurpose,
     PaymentSucceeded,
     ProviderError,
     ProviderSubscriptionRef,
     RenewalRequest,
+    WebhookEvent,
     WebhookRejected,
 )
 from paidclub.config import STARS_SUBSCRIPTION_PERIOD
@@ -183,7 +183,7 @@ class StarsProvider:
 
     async def parse_webhook(
         self, headers: Mapping[str, str], body: bytes
-    ) -> Sequence[PaymentSucceeded | PaymentFailed]:
+    ) -> Sequence[WebhookEvent]:
         raise WebhookRejected("Stars payments arrive as bot updates, not webhooks")
 
     async def cancel(self, ref: ProviderSubscriptionRef) -> None:

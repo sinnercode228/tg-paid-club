@@ -24,10 +24,10 @@ from collections.abc import Mapping
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from paidclub.billing.base import ProviderError, WebhookRejected
+from paidclub.billing.base import PaymentRefunded, ProviderError, WebhookRejected
 from paidclub.container import Core
 from paidclub.db import ConcurrentUpdateError
-from paidclub.payments import ApplyResult, apply_event
+from paidclub.payments import ApplyResult, apply_event, apply_refund
 
 log = logging.getLogger(__name__)
 
@@ -56,8 +56,13 @@ async def process_webhook(
     provider = core.providers.get(provider_name)
     if provider is None:
         raise UnknownProvider(provider_name)
-    events = await provider.parse_webhook(headers, body)
-    return [await apply_event(core, event) for event in events]
+    results = []
+    for event in await provider.parse_webhook(headers, body):
+        if isinstance(event, PaymentRefunded):
+            results.append(await apply_refund(core, event))
+        else:
+            results.append(await apply_event(core, event))
+    return results
 
 
 async def read_body(request: Request, limit: int = MAX_BODY_BYTES) -> bytes:

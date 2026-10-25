@@ -27,9 +27,15 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from paidclub import texts
-from paidclub.billing.base import BillingEvent, PaymentFailed, PaymentPurpose, PaymentSucceeded
+from paidclub.billing.base import (
+    BillingEvent,
+    PaymentFailed,
+    PaymentPurpose,
+    PaymentRefunded,
+    PaymentSucceeded,
+)
 from paidclub.container import Core
-from paidclub.db import in_transaction
+from paidclub.db import in_transaction, insert_ignore
 from paidclub.domain import subscriptions as domain
 from paidclub.domain.subscriptions import RenewalMode, SubStatus
 from paidclub.models import (
@@ -39,6 +45,7 @@ from paidclub.models import (
     Payment,
     PaymentOutcome,
     PaymentStatus,
+    Refund,
     Subscription,
 )
 from paidclub.notifications import enqueue
@@ -341,6 +348,98 @@ async def _apply_failure(
     write_state(sub, state, now=now)
     await notify_renewal_failed(session, core, sub, attempt=attempt, now=now)
     return PaymentOutcome.APPLIED
+
+
+async def apply_refund(core: Core, event: PaymentRefunded) -> ApplyResult:
+    """Record a refund and stop charging the member it went to.
+
+    The owner refunds in the provider's dashboard, so the refund itself is a fact to record,
+    not a decision to make. Whatever the amount, it means the member does not want to keep
+    paying: auto-renew is turned off (the access already paid for stays until the period
+    end; a past-due subscription ends at once, like any cancel while past due) and the saved
+    card is forgotten, so not even a resume charges it again.
+    """
+
+    async def work(session: AsyncSession) -> ApplyResult:
+        now = core.clock.now()
+        payment = (
+            await session.scalars(
+                select(Payment).where(
+                    Payment.provider == event.provider,
+                    Payment.provider_payment_id == event.provider_payment_id,
+                )
+            )
+        ).one_or_none()
+        sub_id = payment.subscription_id if payment is not None else None
+        inserted = await insert_ignore(
+            session,
+            Refund.__table__,  # type: ignore[arg-type]
+            {
+                "provider": event.provider,
+                "refund_id": event.refund_id,
+                "provider_payment_id": event.provider_payment_id,
+                "payment_id": payment.id if payment is not None else None,
+                "subscription_id": sub_id,
+                "amount_minor": event.amount.minor,
+                "currency": event.amount.currency,
+                "occurred_at": event.occurred_at,
+                "created_at": now,
+            },
+            ["provider", "refund_id"],
+        )
+        if not inserted:
+            return ApplyResult(PaymentOutcome.DUPLICATE, sub_id)
+        sub = await session.get(Subscription, sub_id, populate_existing=True) if sub_id else None
+        if sub is None:
+            log.info(
+                "refund %s of payment %s: not ours", event.refund_id, event.provider_payment_id
+            )
+            return ApplyResult(PaymentOutcome.RECORDED, None)
+
+        if sub.status in (SubStatus.ACTIVE, SubStatus.PAST_DUE):
+            write_state(sub, domain.cancel(state_of(sub), now=now), now=now)
+        sub.payment_method_id = None
+        sub.updated_at = now
+        await session.flush()
+        has_access = domain.has_access(state_of(sub), now)
+        until = sub.current_period_end if has_access else None
+        access = (
+            f"доступ по оплаченному периоду сохранится до {texts.fmt_date(until, core.tz)}"
+            if until is not None
+            else "доступ к клубу закрыт"
+        )
+        await alert_owner(
+            session,
+            core,
+            key=f"owner:refund_done:{event.provider}:{event.refund_id}",
+            text=f"Возврат {event.amount.human()} по платежу {event.provider} "
+            f"{event.provider_payment_id}: у подписки #{sub.id} (участник "
+            f"{sub.member.telegram_id}) отключено автопродление и удалена сохранённая карта, "
+            f"{access}.",
+        )
+        await enqueue(
+            session,
+            key=f"refunded:{event.provider}:{event.refund_id}",
+            kind="refunded",
+            chat_id=sub.member.telegram_id,
+            member_id=sub.member_id,
+            message=texts.refunded(amount=event.amount, access_until=until, tz=core.tz),
+            now=now,
+        )
+        return ApplyResult(
+            PaymentOutcome.APPLIED, sub.id, status=sub.status, period_end=sub.current_period_end
+        )
+
+    result = await in_transaction(core.sessions, work)
+    log.info(
+        "refund %s/%s of %s -> %s (subscription %s)",
+        event.provider,
+        event.refund_id,
+        event.provider_payment_id,
+        result.outcome.value,
+        result.subscription_id,
+    )
+    return result
 
 
 async def notify_renewal_failed(

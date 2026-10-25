@@ -10,10 +10,10 @@ from paidclub.billing.base import (
     ChargeResult,
     Checkout,
     CheckoutRequest,
-    PaymentFailed,
     PaymentSucceeded,
     ProviderSubscriptionRef,
     RenewalRequest,
+    WebhookEvent,
 )
 from paidclub.billing.fake import CardKind, FakeProvider
 from paidclub.container import Core
@@ -141,7 +141,7 @@ class StubStarsProvider:
 
     async def parse_webhook(
         self, headers: Mapping[str, str], body: bytes
-    ) -> Sequence[PaymentSucceeded | PaymentFailed]:
+    ) -> Sequence[WebhookEvent]:
         return []
 
     async def cancel(self, ref: ProviderSubscriptionRef) -> None:

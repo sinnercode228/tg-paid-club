@@ -40,6 +40,7 @@ from paidclub.billing.base import (
     ProviderError,
     ProviderSubscriptionRef,
     RenewalRequest,
+    WebhookEvent,
     WebhookRejected,
 )
 from paidclub.clock import Clock
@@ -244,7 +245,7 @@ class FakeProvider:
 
     async def parse_webhook(
         self, headers: Mapping[str, str], body: bytes
-    ) -> Sequence[PaymentSucceeded | PaymentFailed]:
+    ) -> Sequence[WebhookEvent]:
         lowered = {key.lower(): value for key, value in headers.items()}
         signature = lowered.get(SIGNATURE_HEADER.lower(), "")
         if not signature.startswith("sha256=") or not hmac.compare_digest(

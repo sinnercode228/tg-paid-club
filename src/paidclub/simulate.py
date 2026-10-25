@@ -35,7 +35,7 @@ from sqlalchemy import func, select
 from paidclub import club
 from paidclub.access import RevokeOutcome
 from paidclub.billing import ProviderRegistry
-from paidclub.billing.base import PaymentSucceeded
+from paidclub.billing.base import PaymentRefunded, PaymentSucceeded
 from paidclub.billing.fake import CardKind, FakeProvider
 from paidclub.clock import FakeClock
 from paidclub.config import PlanConfig, Settings
@@ -302,6 +302,7 @@ class _Simulation:
         headers, body = self.fake.checkout_webhook(session, succeeded=succeeded, card=card)
         applied = False
         for event in await self.fake.parse_webhook(headers, body):
+            assert not isinstance(event, PaymentRefunded)  # the fake provider never refunds
             result = await apply_event(self.core, event)
             applied = applied or (
                 isinstance(event, PaymentSucceeded) and result.outcome is PaymentOutcome.APPLIED

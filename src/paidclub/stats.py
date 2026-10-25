@@ -60,7 +60,7 @@ means the owner's today.
     Sum of applied successful payments, per currency. Money that arrived but changed nothing
     (a repeat payment for a paid period, a wrong amount, an unknown subscription) is not
     revenue: it is counted in ``needs_attention`` and the owner was alerted to refund it.
-    Refunds are not recorded, so this is gross revenue.
+    Refunds are recorded on their own (``refunds``) and not subtracted: this is gross revenue.
 ``exposed``
     Subscriptions that had access at some point in the window: live at its start, plus
     ``new`` and ``reactivated`` inside it.

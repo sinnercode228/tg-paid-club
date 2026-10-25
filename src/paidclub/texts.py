@@ -179,5 +179,18 @@ def access_ended(*, reason: ExpireReason) -> MessageDraft:
     )
 
 
+def refunded(*, amount: Money, access_until: datetime | None, tz: tzinfo) -> MessageDraft:
+    tail = (
+        f"Доступ к клубу по оплаченному периоду сохранится до {fmt_date(access_until, tz)}."
+        if access_until is not None
+        else "Доступ к клубу закрыт."
+    )
+    return MessageDraft(
+        f"Вам вернули {amount.human()} за подписку. Автопродление отключено, сохранённая карта "
+        f"больше не используется. {tail} Вернуться можно в любой момент:",
+        (Button("Выбрать тариф", callback_data=callbacks.PLANS),),
+    )
+
+
 def owner_alert(text: str) -> MessageDraft:
     return MessageDraft(f"Требует внимания. {text}")

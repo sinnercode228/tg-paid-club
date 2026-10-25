@@ -293,6 +293,27 @@ Index(
 )
 
 
+class Refund(Base):
+    """Money that went back to a member. Recorded once per provider refund id; revenue in the
+    stats stays gross."""
+
+    __tablename__ = "refunds"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(16))
+    refund_id: Mapped[str] = mapped_column(String(128))
+    #: The refunded payment as the provider names it, and our row for it if we have one.
+    provider_payment_id: Mapped[str] = mapped_column(String(128))
+    payment_id: Mapped[int | None] = mapped_column(ForeignKey("payments.id"))
+    subscription_id: Mapped[int | None] = mapped_column(ForeignKey("subscriptions.id"))
+    amount_minor: Mapped[int] = mapped_column(BigInteger)
+    currency: Mapped[str] = mapped_column(String(3))
+    occurred_at: Mapped[datetime]
+    created_at: Mapped[datetime]
+
+    __table_args__ = (UniqueConstraint("provider", "refund_id", name="uq_refunds_provider_id"),)
+
+
 class ChargeAttemptStatus(StrEnum):
     #: Row written, provider call not finished (or the worker died mid-call).
     STARTED = "started"
