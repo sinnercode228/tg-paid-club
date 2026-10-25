@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,6 +16,19 @@ from tests.helpers import ADMIN_ID, CHAT_ID, OWNER_ID, FakeRevoker, RecordingSen
 
 #: The 31st on purpose: month arithmetic has to clamp (Feb 28) and then come back (Mar 31).
 START = datetime(2026, 1, 31, 9, 0, tzinfo=UTC)
+
+
+@pytest.fixture
+def clean_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """No PAIDCLUB_* variable or .env file of the developer's leaks into the test; the test
+    runs in an empty directory, which is returned."""
+    for name in list(os.environ):
+        if name.startswith("PAIDCLUB_"):
+            monkeypatch.delenv(name)
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    monkeypatch.chdir(workdir)
+    return workdir
 
 
 @pytest.fixture

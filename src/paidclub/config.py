@@ -7,11 +7,14 @@ List settings accept either JSON (``[1, 3]``) or a comma-separated string (``1,3
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from datetime import timedelta
 from decimal import Decimal
 from functools import lru_cache
 from typing import Annotated, Any, Literal, Self
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -23,6 +26,22 @@ ProviderName = Literal["fake", "yookassa", "stars"]
 
 #: Telegram Stars subscriptions renew every 30 days; it is the only period the Bot API accepts.
 STARS_SUBSCRIPTION_PERIOD = timedelta(days=30)
+
+#: Where Telegram delivers updates in webhook mode, under ``public_base_url``.
+TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"
+#: The Bot API's rule for ``setWebhook``'s ``secret_token``.
+TELEGRAM_SECRET_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,256}")
+#: ``<bot id>:<secret>`` as @BotFather issues it.
+BOT_TOKEN_PATTERN = re.compile(r"[0-9]+:[A-Za-z0-9_-]+")
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
+#: Accepted URL schemes and the async driver each one runs on.
+ASYNC_DRIVERS = {
+    "sqlite": "sqlite+aiosqlite",
+    "sqlite+aiosqlite": "sqlite+aiosqlite",
+    "postgres": "postgresql+asyncpg",
+    "postgresql": "postgresql+asyncpg",
+    "postgresql+asyncpg": "postgresql+asyncpg",
+}
 
 
 class PlanConfig(BaseModel):
@@ -84,6 +103,14 @@ def _only_fake() -> list[ProviderName]:
     return ["fake"]
 
 
+def _http_url(value: str) -> str:
+    url = value.strip()
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.netloc:
+        raise ValueError(f"must be an http:// or https:// URL, got {value!r}")
+    return url
+
+
 def _split_csv(value: Any) -> Any:
     if isinstance(value, str):
         text = value.strip()
@@ -100,6 +127,8 @@ class Settings(BaseSettings):
         env_prefix="PAIDCLUB_",
         env_file=".env",
         env_file_encoding="utf-8",
+        # ``PAIDCLUB_OWNER_ID=`` in a copied .env.example means "not set", not "invalid".
+        env_ignore_empty=True,
         extra="ignore",
     )
 
@@ -120,8 +149,17 @@ class Settings(BaseSettings):
     admin_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
     #: Private channel and/or group ids the subscription grants access to (``-100...``).
     club_chat_ids: Annotated[list[int], NoDecode] = Field(default_factory=list)
+    #: ``polling`` asks Telegram for updates (no public URL needed); ``webhook`` has Telegram
+    #: push them to ``{public_base_url}/telegram/webhook``, which must be HTTPS.
+    bot_mode: Literal["polling", "webhook"] = "polling"
+    #: Telegram sends it back in ``X-Telegram-Bot-Api-Secret-Token`` with every webhook call.
+    telegram_webhook_secret: SecretStr | None = None
 
     # --- web -------------------------------------------------------------------------------
+    #: Address and port the web app (webhooks, checkout page, dashboard) listens on. The
+    #: Docker image sets the host to ``0.0.0.0``.
+    web_host: str = "127.0.0.1"
+    web_port: int = Field(default=8000, ge=0, le=65535)
     #: Public base URL of the FastAPI app (checkout pages, webhooks, return URLs).
     public_base_url: str = "http://localhost:8000"
     #: Bearer token for ``/admin``. Either this or ``admin_password`` must be set to open it.
@@ -179,6 +217,78 @@ class Settings(BaseSettings):
     def _parse_lists(cls, value: Any) -> Any:
         return _split_csv(value)
 
+    @field_validator("database_url")
+    @classmethod
+    def _check_database_url(cls, value: str) -> str:
+        url = value.strip()
+        scheme, sep, rest = url.partition("://")
+        if not sep:
+            raise ValueError(
+                "must be a URL like sqlite+aiosqlite:///./paidclub.db or "
+                "postgresql+asyncpg://user:password@host:5432/paidclub"
+            )
+        # The app is async: plain postgresql:// and sqlite:// would load sync drivers.
+        driver = ASYNC_DRIVERS.get(scheme.lower())
+        if driver is None:
+            raise ValueError(
+                f"unsupported database {scheme!r}: use sqlite+aiosqlite or postgresql+asyncpg"
+            )
+        return f"{driver}://{rest}"
+
+    @field_validator("log_level")
+    @classmethod
+    def _check_log_level(cls, value: str) -> str:
+        level = value.strip().upper()
+        if level not in LOG_LEVELS:
+            raise ValueError(f"must be one of {', '.join(LOG_LEVELS)}, got {value!r}")
+        return level
+
+    @field_validator("display_timezone")
+    @classmethod
+    def _check_timezone(cls, value: str) -> str:
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"unknown timezone {value!r}, use an IANA name like Europe/Moscow"
+            ) from exc
+        return value
+
+    @field_validator("bot_token")
+    @classmethod
+    def _check_bot_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        if not BOT_TOKEN_PATTERN.fullmatch(value.get_secret_value()):
+            # The token itself is not echoed: it may be a real one with a typo.
+            raise ValueError("does not look like a bot token from @BotFather (123456:ABC-...)")
+        return value
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _check_base_url(cls, value: str) -> str:
+        # Paths are appended to it (``/webhooks/yookassa``), so no trailing slash or query.
+        url = _http_url(value).rstrip("/")
+        if urlsplit(url).query or urlsplit(url).fragment:
+            raise ValueError(f"must not have a query string or fragment, got {value!r}")
+        return url
+
+    @field_validator("checkout_return_url")
+    @classmethod
+    def _check_return_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        return _http_url(value)
+
+    @field_validator("telegram_webhook_secret")
+    @classmethod
+    def _check_webhook_secret(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None or not value.get_secret_value():
+            return None
+        if not TELEGRAM_SECRET_PATTERN.fullmatch(value.get_secret_value()):
+            raise ValueError("Telegram accepts 1-256 characters: letters A-Z, a-z, digits, _ and -")
+        return value
+
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
         if any(day <= 0 for day in self.dunning_retry_days):
@@ -209,6 +319,14 @@ class Settings(BaseSettings):
             raise ValueError("the yookassa provider needs yookassa_shop_id and yookassa_secret_key")
         if self.env == "prod" and "fake" in self.providers:
             raise ValueError("the fake provider is for demos and tests; disable it in prod")
+        if self.bot_mode == "webhook":
+            if not self.public_base_url.startswith("https://"):
+                raise ValueError(
+                    "bot_mode=webhook needs an https:// public_base_url: Telegram only "
+                    "delivers webhooks over HTTPS"
+                )
+            if self.telegram_webhook_secret is None:
+                raise ValueError("bot_mode=webhook needs telegram_webhook_secret")
         return self
 
     # --- derived values --------------------------------------------------------------------
@@ -236,6 +354,10 @@ class Settings(BaseSettings):
     @property
     def claim_lease(self) -> timedelta:
         return timedelta(seconds=self.claim_lease_seconds)
+
+    @property
+    def telegram_webhook_url(self) -> str:
+        return f"{self.public_base_url}{TELEGRAM_WEBHOOK_PATH}"
 
 
 @lru_cache
