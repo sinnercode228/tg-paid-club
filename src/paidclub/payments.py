@@ -187,20 +187,23 @@ async def _apply_success(
 
     next_period = sub.periods_paid + 1
     problem: str | None = None
-    if event.period_end is not None:
-        # Provider-authoritative period (Stars): an end we already have is a repeat.
-        if (
-            sub.current_period_end is not None
-            and sub.status is not SubStatus.EXPIRED
-            and event.period_end <= sub.current_period_end
-        ):
-            problem = "этот период уже оплачен"
-    elif event.for_period is not None and event.for_period != next_period:
+    if event.for_period is not None and event.for_period != next_period:
+        # Checked first, also for provider-authoritative periods: a Stars first payment names
+        # the period its invoice was created for, so a second Telegram subscription bought
+        # from the same invoice is a repeat even though its end is a little later.
         problem = (
             "этот период уже оплачен"
             if event.for_period < next_period
             else f"платёж за период {event.for_period}, а оплачено {sub.periods_paid}"
         )
+    elif (
+        # Provider-authoritative period (Stars): an end we already have is a repeat.
+        event.period_end is not None
+        and sub.current_period_end is not None
+        and sub.status is not SubStatus.EXPIRED
+        and event.period_end <= sub.current_period_end
+    ):
+        problem = "этот период уже оплачен"
     if problem is None and sub.status in (SubStatus.PENDING, SubStatus.EXPIRED):
         other = await live_subscription(session, sub.member_id, exclude_id=sub.id)
         if other is not None:
