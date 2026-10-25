@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -38,8 +37,8 @@ LEASE = timedelta(minutes=5)
 
 
 @pytest.fixture
-async def sessions(tmp_path: Path) -> AsyncIterator[SessionFactory]:
-    engine = create_engine(f"sqlite+aiosqlite:///{tmp_path / 'db.sqlite'}")
+async def sessions(database_url: str) -> AsyncIterator[SessionFactory]:
+    engine = create_engine(database_url)
     await create_all(engine)
     yield make_sessionmaker(engine)
     await engine.dispose()
