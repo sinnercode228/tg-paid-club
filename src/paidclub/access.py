@@ -6,9 +6,14 @@ declines accordingly, so a forwarded link is useless to someone without a subscr
 
 Removal goes through an :class:`AccessRevoker`, which the bot implements with
 ``banChatMember`` followed by ``unbanChatMember(only_if_banned=True)``: the member is out, but
-not on a ban list, so the same link works again after they pay. The scheduler calls
-:func:`revoke_expired_access`; a subscription is only marked as revoked once every chat has
-given a final answer, so a network error or a crash means "try again next tick".
+not on a ban list, so the same link works again after they pay (see
+:mod:`paidclub.bot.revoker`). The scheduler calls :func:`revoke_expired_access`; a
+subscription is only marked as revoked once every chat has given a final answer, so a network
+error or a crash means "try again next tick".
+
+"The bot lacks rights" is a final answer too (the owner is alerted), but not a permanent one:
+once the bot is an admin with the right to ban again, :func:`requeue_removals` puts those
+members back in line.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ from datetime import timedelta
 from enum import StrEnum
 from typing import Literal, Protocol
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from paidclub import texts
@@ -261,6 +266,55 @@ async def revoke_expired_access(
                     until=core.clock.now() + retry_in if transient else None,
                 )
     return report
+
+
+#: Access events that settle a removal attempt in one chat, one way or another.
+_REMOVAL_OUTCOMES = (
+    AccessEventKind.REMOVED,
+    AccessEventKind.NOT_PARTICIPANT,
+    AccessEventKind.SKIPPED_ADMIN,
+    AccessEventKind.SKIPPED_HAS_ACCESS,
+    AccessEventKind.NO_RIGHTS,
+)
+
+
+async def requeue_removals(core: Core, chat_id: int) -> int:
+    """Retry removals from ``chat_id`` whose last attempt failed for lack of admin rights.
+
+    Called when the bot is (again) an admin there. Expired subscriptions whose latest removal
+    outcome in this chat is ``no_rights`` get ``access_revoked_at`` cleared, so the next
+    scheduler tick tries again. Returns how many were put back.
+    """
+    latest = (
+        select(AccessEvent.subscription_id, func.max(AccessEvent.id).label("last_id"))
+        .where(
+            AccessEvent.chat_id == chat_id,
+            AccessEvent.subscription_id.is_not(None),
+            AccessEvent.kind.in_(_REMOVAL_OUTCOMES),
+        )
+        .group_by(AccessEvent.subscription_id)
+        .subquery()
+    )
+    blocked = (
+        select(AccessEvent.subscription_id)
+        .join(latest, AccessEvent.id == latest.c.last_id)
+        .where(AccessEvent.kind == AccessEventKind.NO_RIGHTS)
+    )
+    async with core.sessions() as session, session.begin():
+        result = await session.execute(
+            update(Subscription)
+            .where(
+                Subscription.id.in_(blocked),
+                Subscription.status == SubStatus.EXPIRED,
+                Subscription.access_revoked_at.is_not(None),
+            )
+            .values(access_revoked_at=None)
+            .execution_options(synchronize_session=False)
+        )
+    count = int(result.rowcount)  # type: ignore[attr-defined]
+    if count:
+        log.info("chat %s: %s removals blocked by missing rights will be retried", chat_id, count)
+    return count
 
 
 async def _alert_missing_rights(session: AsyncSession, core: Core, chat_id: int) -> None:

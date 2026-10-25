@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 from paidclub import club
-from paidclub.access import decide_join_request
+from paidclub.access import RevokeOutcome, decide_join_request, requeue_removals
 from paidclub.billing.base import PaymentFailed, PaymentPurpose
 from paidclub.billing.fake import FakeProvider
 from paidclub.clock import FakeClock
@@ -12,7 +12,8 @@ from paidclub.models import AccessEventKind
 from paidclub.money import Money
 from paidclub.payments import apply_event
 from paidclub.repo import member_by_telegram_id
-from tests.helpers import CHAT_ID, OWNER_ID, access_events, subscribe
+from paidclub.scheduler import Scheduler
+from tests.helpers import CHAT_ID, OWNER_ID, FakeRevoker, access_events, load_sub, subscribe
 
 FEB_28 = datetime(2026, 2, 28, 9, 0, tzinfo=UTC)
 MEMBER = 801
@@ -91,3 +92,50 @@ async def test_a_past_due_member_gets_in_only_during_grace(
 
 async def test_the_owner_is_always_approved(core: Core) -> None:
     assert await decide(core, telegram_id=OWNER_ID) == "approve"
+
+
+async def expire_canceled(
+    core: Core, fake: FakeProvider, clock: FakeClock, *members: int
+) -> dict[int, int]:
+    subs = {}
+    for telegram_id in members:
+        subs[telegram_id] = await subscribe(core, fake, telegram_id)
+        await club.cancel(core, telegram_id=telegram_id, subscription_id=subs[telegram_id])
+    clock.set(FEB_28)
+    return subs
+
+
+async def test_removals_blocked_by_missing_rights_are_retried_once_rights_return(
+    core: Core, fake: FakeProvider, clock: FakeClock
+) -> None:
+    blocked, removed = MEMBER, MEMBER + 1
+    subs = await expire_canceled(core, fake, clock, blocked, removed)
+    revoker = FakeRevoker()
+    revoker.outcomes = {blocked: RevokeOutcome.NO_RIGHTS}
+    await Scheduler(core, revoker).tick()
+
+    assert await requeue_removals(core, -100555) == 0  # another chat: nothing to retry
+    assert await requeue_removals(core, CHAT_ID) == 1
+    assert (await load_sub(core, subs[blocked])).access_revoked_at is None
+    assert (await load_sub(core, subs[removed])).access_revoked_at is not None
+
+    revoker.outcomes = {}
+    assert (await Scheduler(core, revoker).tick()).removed == 1
+    assert await requeue_removals(core, CHAT_ID) == 0  # the latest outcome is now "removed"
+    kinds = [e.kind for e in await access_events(core) if e.telegram_id == blocked]
+    assert kinds == [AccessEventKind.NO_RIGHTS, AccessEventKind.REMOVED]
+
+
+async def test_requeue_leaves_members_who_paid_again_alone(
+    core: Core, fake: FakeProvider, clock: FakeClock
+) -> None:
+    subs = await expire_canceled(core, fake, clock, MEMBER)
+    revoker = FakeRevoker()
+    revoker.outcomes = {MEMBER: RevokeOutcome.NO_RIGHTS}
+    await Scheduler(core, revoker).tick()
+    link = await club.start_repayment(core, telegram_id=MEMBER, subscription_id=subs[MEMBER])
+    page = fake.read_checkout(link.url.rsplit("/", 1)[1])
+    [event] = await fake.parse_webhook(*fake.checkout_webhook(page, succeeded=True))
+    await apply_event(core, event)  # reactivated: no longer expired
+
+    assert await requeue_removals(core, CHAT_ID) == 0
