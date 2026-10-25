@@ -5,7 +5,8 @@
   integer``), instead of a pydantic traceback. Values are never echoed: some are secrets.
 * :func:`startup_problems` lists what a valid configuration still lacks for a command:
   ``run`` cannot start without a bot token (an error), and a dashboard without a password is
-  only switched off (a warning).
+  only switched off (a warning). The fake provider is refused where its free payment page
+  would be reachable by strangers, unless ``PAIDCLUB_DEMO=1`` says that is the point.
 * :func:`describe` is the summary ``paidclub check`` prints.
 """
 
@@ -144,6 +145,9 @@ def startup_problems(settings: Settings, command: Command = "run") -> list[Probl
             f"{settings.public_base_url}/webhooks/yookassa will not receive them, and a "
             "first payment is applied only when its notification arrives"
         )
+    if command in ("run", "web") and not settings.demo:
+        for message in _fake_provider_exposed(settings):
+            error(message)
     if "fake" in settings.providers and "fake_webhook_secret" not in settings.model_fields_set:
         warning(
             "PAIDCLUB_FAKE_WEBHOOK_SECRET is not set: a random one is made at every start, so "
@@ -155,6 +159,36 @@ def startup_problems(settings: Settings, command: Command = "run") -> list[Probl
             "PAIDCLUB_ADMIN_PASSWORD to open it"
         )
     return problems
+
+
+_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
+
+
+def _is_local(url: str) -> bool:
+    host = (urlsplit(url).hostname or "").lower()
+    return host in _LOCAL_HOSTS or host.endswith(".localhost")
+
+
+def _fake_provider_exposed(settings: Settings) -> list[str]:
+    """The fake provider's page lets anyone "pay" without money. That is the demo; next to a
+    real provider, or for real club chats on a public address, it gives the club away."""
+    if "fake" not in settings.providers:
+        return []
+    real = [name for name in settings.providers if name != "fake"]
+    if real:
+        return [
+            f"PAIDCLUB_PROVIDERS has fake next to {', '.join(real)}: members would be offered "
+            "the demo payment page, where anyone pays without money. Remove fake, or set "
+            "PAIDCLUB_DEMO=1 if this is a demo"
+        ]
+    if settings.club_chat_ids and not _is_local(settings.public_base_url):
+        return [
+            "PAIDCLUB_PROVIDERS=fake with club chats at a public "
+            f"PAIDCLUB_PUBLIC_BASE_URL ({settings.public_base_url}): anyone could join through "
+            "the demo payment page without paying. Use yookassa or stars, or set "
+            "PAIDCLUB_DEMO=1 if this is a demo"
+        ]
+    return []
 
 
 def _secret_set(value: Any) -> bool:
@@ -192,7 +226,7 @@ def describe(settings: Settings) -> list[str]:
         return ", ".join(f"{value:g}" for value in values) or "none"
 
     return [
-        f"env: {settings.env}",
+        f"env: {settings.env}" + (", demo" if settings.demo else ""),
         f"database: {safe_database_url(settings.database_url)}",
         f"bot: {settings.bot_mode}, token {'set' if settings.bot_token else 'not set'}, "
         f"owner {settings.owner_id if settings.owner_id is not None else 'not set'}, "

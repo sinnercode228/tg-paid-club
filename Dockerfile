@@ -16,8 +16,10 @@ COPY --from=build /wheels /wheels
 RUN pip install --no-index --find-links /wheels "tg-paid-club[postgres]" && rm -rf /wheels
 WORKDIR /app
 USER paidclub
-# Listen on every interface inside the container; publish the port as needed.
-ENV PAIDCLUB_WEB_HOST=0.0.0.0 \
+# Listen on every interface inside the container; publish the port as needed. prod refuses
+# the fake demo provider; a demo sets PAIDCLUB_ENV=dev in .env.
+ENV PAIDCLUB_ENV=prod \
+    PAIDCLUB_WEB_HOST=0.0.0.0 \
     PAIDCLUB_WEB_PORT=8000
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

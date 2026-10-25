@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from paidclub.checks import (
+    Command,
     ConfigError,
     describe,
     load_settings,
@@ -207,3 +208,67 @@ def test_env_example_shows_the_default_plans() -> None:
     ]
     plans = json.loads(line.removeprefix("# PAIDCLUB_PLANS=").strip("'"))
     assert tuple(PlanConfig.model_validate(plan) for plan in plans) == DEFAULT_PLANS
+
+
+# --- the fake provider in a real deployment ----------------------------------------------------
+
+PUBLIC_CLUB: dict[str, Any] = {
+    "bot_token": TOKEN,
+    "owner_id": 1,
+    "club_chat_ids": [-1001],
+    "fake_webhook_secret": "fixed",
+    "admin_token": "t" * 32,
+    "public_base_url": "https://club.example",
+}
+
+
+def errors(settings: Settings, command: Command = "run") -> list[str]:
+    return [p.message for p in startup_problems(settings, command) if p.severity == "error"]
+
+
+def test_the_shipped_env_file_is_refused_once_it_points_at_a_real_club(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The compose quick start: cp .env.example .env, then the bot, the owner, the chat and
+    the public HTTPS address of a reverse proxy. PAIDCLUB_PROVIDERS=fake stays."""
+    (Path.cwd() / ".env").write_text(
+        (ROOT / ".env.example").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    for name, value in {
+        "BOT_TOKEN": TOKEN,
+        "OWNER_ID": "1",
+        "CLUB_CHAT_IDS": "-1001",
+        "PUBLIC_BASE_URL": "https://club.example",
+        "FAKE_WEBHOOK_SECRET": "x" * 32,
+    }.items():
+        monkeypatch.setenv(f"PAIDCLUB_{name}", value)
+    settings = load_settings()
+    assert settings.providers == ["fake"]
+    commands: tuple[Command, ...] = ("run", "web")
+    for command in commands:
+        [error] = errors(settings, command)
+        assert "anyone could join through the demo payment page" in error
+    assert errors(settings.model_copy(update={"demo": True})) == []
+
+
+def test_the_fake_provider_next_to_a_real_one_is_refused() -> None:
+    settings = make(
+        **{**PUBLIC_CLUB, "public_base_url": "http://localhost:8000"},
+        providers=["yookassa", "fake"],
+        yookassa_shop_id="1",
+        yookassa_secret_key="k",
+    )
+    [error] = errors(settings)
+    assert error.startswith("PAIDCLUB_PROVIDERS has fake next to yookassa")
+
+
+def test_the_fake_provider_on_localhost_or_without_chats_is_the_demo() -> None:
+    local = make(**{**PUBLIC_CLUB, "public_base_url": "http://localhost:8000"})
+    assert errors(local) == []
+    no_chats = make(**{**PUBLIC_CLUB, "club_chat_ids": []})
+    assert errors(no_chats) == []
+
+
+def test_the_docker_image_runs_in_prod_mode() -> None:
+    """prod refuses the fake provider; the image must not run as a demo by default."""
+    assert "ENV PAIDCLUB_ENV=prod" in (ROOT / "Dockerfile").read_text(encoding="utf-8")

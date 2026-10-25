@@ -121,6 +121,10 @@ def test_mode_flag_overrides_the_setting_and_is_validated(
     assert "PAIDCLUB_BOT_MODE=webhook needs an https:// PAIDCLUB_PUBLIC_BASE_URL" in err
 
     configure(monkeypatch, public_base_url="https://club.example", telegram_webhook_secret="s3cret")
+    # The fake provider for a club on a public address has to be declared a demo.
+    assert cli.main(["run", "--mode", "webhook"]) == cli.EXIT_CONFIG
+    assert "PAIDCLUB_DEMO=1" in capsys.readouterr().err
+    configure(monkeypatch, demo="1")
     assert cli.main(["run", "--mode", "webhook"]) == 0
     assert served[-1][0].bot_mode == "webhook"
 

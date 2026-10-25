@@ -1,6 +1,9 @@
 # The app (bot, web app, scheduler and outbox in one process) with PostgreSQL.
 #   cp .env.example .env    # set PAIDCLUB_BOT_TOKEN, PAIDCLUB_OWNER_ID, PAIDCLUB_CLUB_CHAT_IDS
+#                           # and a real provider in PAIDCLUB_PROVIDERS (yookassa, stars)
 #   docker compose up --build
+# The image runs with PAIDCLUB_ENV=prod, which refuses the fake demo provider; for a demo in
+# Docker, set PAIDCLUB_ENV=dev in .env.
 # The web app is published on 127.0.0.1:8000 only; put an HTTPS reverse proxy in front of it
 # for YooKassa notifications, the Telegram webhook mode and the /admin login.
 services:

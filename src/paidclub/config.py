@@ -133,7 +133,11 @@ class Settings(BaseSettings):
     )
 
     # --- runtime ---------------------------------------------------------------------------
+    #: ``prod`` refuses the fake provider and hides the API docs. The Docker image sets it.
     env: Literal["dev", "test", "prod"] = "dev"
+    #: This deployment is a public demo: allow the fake provider, whose payment page lets
+    #: anyone "pay" without money, for real club chats on a public address.
+    demo: bool = False
     log_level: str = "INFO"
     #: Timezone used to print dates in messages to members. Storage is always UTC.
     display_timezone: str = "Europe/Moscow"
