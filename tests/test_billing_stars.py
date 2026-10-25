@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator, AsyncIterator, Iterator
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -20,6 +21,8 @@ from aiogram.methods import (
 from aiogram.methods.base import TelegramType
 from aiogram.types import LabeledPrice, SuccessfulPayment, Update, User
 from pydantic import SecretStr
+from sqlalchemy import event, select
+from sqlalchemy.exc import OperationalError
 
 from paidclub import club
 from paidclub.billing import stars as stars_module
@@ -39,6 +42,7 @@ from paidclub.billing.stars import (
     ERROR_STALE,
     ERROR_UNAVAILABLE,
     InvoicePayload,
+    PaymentNotStored,
     StarsProvider,
     check_pre_checkout,
     create_stars_router,
@@ -50,7 +54,7 @@ from paidclub.clock import FakeClock
 from paidclub.config import Settings
 from paidclub.container import Core, build_core
 from paidclub.domain.subscriptions import SubStatus
-from paidclub.models import PaymentOutcome
+from paidclub.models import PaymentOutcome, StarsPaymentStatus, StarsPaymentUpdate
 from paidclub.money import Money
 from paidclub.runner import build_app
 from paidclub.scheduler import Scheduler
@@ -146,10 +150,14 @@ def stars(core: Core, bot: Bot) -> StarsProvider:
     return provider
 
 
+async def no_sleep(seconds: float) -> None:
+    return None
+
+
 @pytest.fixture
 def dispatcher(core: Core, stars: StarsProvider) -> Dispatcher:
     dp = Dispatcher()
-    dp.include_router(create_stars_router(core))
+    dp.include_router(create_stars_router(core, sleep=no_sleep))
     return dp
 
 
@@ -802,3 +810,96 @@ async def test_a_renewal_charged_before_the_cancel_keeps_auto_renew_off(
         None,
         renewed_until,
     )
+
+
+# --- payments that meet a database error --------------------------------------------------------
+
+
+@contextlib.contextmanager
+def failing_inserts(core: Core, table: str, times: int) -> Iterator[list[int]]:
+    """``INSERT INTO <table>`` fails ``times`` times with "database is locked"."""
+    left = [times]
+
+    def fail(conn: Any, cursor: Any, statement: str, *args: Any) -> None:
+        if left[0] and statement.lstrip().upper().startswith(f"INSERT INTO {table.upper()} "):
+            left[0] -= 1
+            raise OperationalError(statement, None, Exception("database is locked"))
+
+    event.listen(core.engine.sync_engine, "before_cursor_execute", fail)
+    try:
+        yield left
+    finally:
+        event.remove(core.engine.sync_engine, "before_cursor_execute", fail)
+
+
+async def stored_updates(core: Core) -> list[StarsPaymentUpdate]:
+    async with core.sessions() as session:
+        rows = await session.scalars(select(StarsPaymentUpdate).order_by(StarsPaymentUpdate.id))
+        return list(rows.all())
+
+
+async def test_a_payment_that_meets_a_database_error_is_applied_by_the_scheduler(
+    core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot, clock: FakeClock
+) -> None:
+    """Telegram does not deliver successful_payment again, and the update was acknowledged
+    already; one failed INSERT INTO payments must not lose the 500 Stars."""
+    sub_id, payload = await stars_invoice(core, session)
+    expires = clock.now() + THIRTY_DAYS
+    with failing_inserts(core, "payments", times=1):
+        await dispatcher.feed_update(
+            bot, payment_update(payload, charge_id="ch_1", expires=expires, first=True)
+        )
+    assert (await load_sub(core, sub_id)).status is SubStatus.PENDING
+    [row] = await stored_updates(core)
+    assert (row.status, row.telegram_payment_charge_id) == (StarsPaymentStatus.PENDING, "ch_1")
+    assert row.last_error is not None and "database is locked" in row.last_error
+
+    clock.advance(timedelta(minutes=1))
+    assert (await Scheduler(core, FakeRevoker()).tick()).stars_applied == 1
+
+    sub = await load_sub(core, sub_id)
+    assert (sub.status, sub.current_period_end, sub.payment_method_id) == (
+        SubStatus.ACTIVE,
+        expires,
+        "ch_1",
+    )
+    [row] = await stored_updates(core)
+    assert row.status is StarsPaymentStatus.APPLIED
+    clock.advance(timedelta(hours=1))
+    assert (await Scheduler(core, FakeRevoker()).tick()).stars_applied == 0
+
+
+async def test_a_payment_that_cannot_be_stored_reaches_the_owner_outside_the_database(
+    core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot, clock: FakeClock
+) -> None:
+    _, payload = await stars_invoice(core, session)
+    update_ = payment_update(
+        payload, charge_id="ch_1", expires=clock.now() + THIRTY_DAYS, first=True
+    )
+    with failing_inserts(core, "stars_payment_updates", times=10), pytest.raises(PaymentNotStored):
+        await dispatcher.feed_update(bot, update_)
+
+    [alert] = [call for call in session.of(SendMessage) if call.chat_id == core.settings.owner_id]
+    assert "ch_1" in alert.text and "500" in alert.text
+    assert await stored_updates(core) == []
+
+
+async def test_a_stored_payment_that_never_applies_is_given_up_with_an_owner_alert(
+    core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot, clock: FakeClock
+) -> None:
+    _, payload = await stars_invoice(core, session)
+    with failing_inserts(core, "payments", times=100):
+        await dispatcher.feed_update(
+            bot,
+            payment_update(
+                payload, charge_id="ch_1", expires=clock.now() + THIRTY_DAYS, first=True
+            ),
+        )
+        for _ in range(stars_module.APPLY_ATTEMPTS + 2):
+            clock.advance(timedelta(hours=1))
+            await Scheduler(core, FakeRevoker()).tick()
+
+    [row] = await stored_updates(core)
+    assert (row.status, row.attempts) == (StarsPaymentStatus.FAILED, stars_module.APPLY_ATTEMPTS)
+    [alert] = await notifications(core, "owner_alert")
+    assert "ch_1" in alert.text

@@ -8,8 +8,8 @@ so a slow handler never makes Telegram wait and send the update again.
 
 Updates are acknowledged before they are handled. A handler that fails is logged, and the
 update is not redelivered; the payment path does not depend on redelivery, because a Stars
-payment that fails to apply is logged with everything needed to apply it by hand. On shutdown
-:meth:`TelegramWebhook.drain` waits for the updates still being handled.
+payment is stored before it is applied and retried by the scheduler if applying fails. On
+shutdown :meth:`TelegramWebhook.drain` waits for the updates still being handled.
 """
 
 from __future__ import annotations

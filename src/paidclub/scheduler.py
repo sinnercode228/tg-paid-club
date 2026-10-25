@@ -20,7 +20,9 @@ A tick does, in this order:
    by its payment id every ``pending_recheck_seconds`` until the provider decides, then
    applied. This runs for the charge, not the subscription, so a charge that settles after
    the member cancelled is still recorded. Checkout payments whose notification may have
-   been lost are looked up the same way (:mod:`paidclub.checkouts`).
+   been lost are looked up the same way (:mod:`paidclub.checkouts`), and Telegram Stars
+   payments that were stored but failed to apply are applied again
+   (:func:`paidclub.billing.stars.retry_stored_payments`).
 3. **Expiry.** Past-due subscriptions whose grace window closed (and that have no retry due)
    and canceled subscriptions whose paid period ended become ``expired``.
 4. **Access.** Members of expired subscriptions are removed from the club chats.
@@ -52,6 +54,7 @@ from paidclub.billing.base import (
     PaymentPurpose,
     RenewalRequest,
 )
+from paidclub.billing.stars import retry_stored_payments
 from paidclub.checkouts import reconcile_checkouts
 from paidclub.container import Core
 from paidclub.db import claim, in_transaction, release
@@ -85,6 +88,8 @@ class TickReport:
     #: Checkout payments looked up, and those of them applied by the lookup.
     checkouts_checked: int = 0
     checkouts_recovered: int = 0
+    #: Stored Telegram Stars payments applied on a retry.
+    stars_applied: int = 0
     renewals_missing: int = 0
     expired: int = 0
     removed: int = 0
@@ -123,6 +128,7 @@ class Scheduler:
             self._renewals,
             self._pending_charges,
             self._checkouts,
+            self._stars_payments,
             self._expire,
             self._revoke,
             self._remind,
@@ -493,6 +499,9 @@ class Scheduler:
         report.checkouts_checked += result.checked
         report.checkouts_recovered += result.recovered
         report.errors += result.errors
+
+    async def _stars_payments(self, report: TickReport) -> None:
+        report.stars_applied += await retry_stored_payments(self.core, batch_size=self.batch_size)
 
     # --- 3. expiry -------------------------------------------------------------------------
 

@@ -24,20 +24,24 @@ Refunds (``refundStarPayment``) are out of scope: when a payment cannot be appli
 the owner, who can refund it.
 
 The provider never touches the database. :func:`create_stars_router` holds the handlers that
-turn Telegram updates into :func:`paidclub.payments.apply_event` calls.
+turn Telegram updates into payments: each ``successful_payment`` is stored as it arrived
+(``stars_payment_updates``) before it is applied, because Telegram does not deliver it again,
+and the scheduler applies stored ones that failed (:func:`retry_stored_payments`).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.types import LabeledPrice, Message, PreCheckoutQuery, SuccessfulPayment
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from paidclub.billing.base import (
     ChargeResult,
@@ -53,10 +57,11 @@ from paidclub.billing.base import (
 )
 from paidclub.config import STARS_SUBSCRIPTION_PERIOD
 from paidclub.container import Core
+from paidclub.db import in_transaction, insert_ignore
 from paidclub.domain.subscriptions import SubStatus
-from paidclub.models import PaymentOutcome, Subscription
+from paidclub.models import PaymentOutcome, StarsPaymentStatus, StarsPaymentUpdate, Subscription
 from paidclub.money import Money
-from paidclub.payments import ApplyResult, apply_event
+from paidclub.payments import ApplyResult, alert_owner, apply_payment_event
 from paidclub.repo import live_subscription
 
 log = logging.getLogger(__name__)
@@ -289,10 +294,122 @@ async def answer_pre_checkout(
     return error
 
 
+class PaymentNotStored(Exception):
+    """A Stars payment could not even be stored; the owner has to apply it by hand."""
+
+    def __init__(self, payment: SuccessfulPayment, user_id: int) -> None:
+        super().__init__(f"Stars payment {payment.telegram_payment_charge_id} not stored")
+        self.payment = payment
+        self.user_id = user_id
+
+    def owner_text(self) -> str:
+        payment = self.payment
+        return (
+            "Требует внимания. Платёж Telegram Stars не удалось сохранить (база данных "
+            f"недоступна): {payment.total_amount} ⭐ от пользователя {self.user_id}, "
+            f"charge id {payment.telegram_payment_charge_id}, счёт {payment.invoice_payload!r}. "
+            "Подписка не продлена: продлите её или верните Stars."
+        )
+
+
 async def handle_successful_payment(
-    core: Core, payment: SuccessfulPayment, *, user_id: int, occurred_at: datetime
+    core: Core,
+    payment: SuccessfulPayment,
+    *,
+    user_id: int,
+    occurred_at: datetime,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> ApplyResult | None:
-    """Apply a Stars payment and keep Telegram's subscriptions in line with ours.
+    """Store a Stars payment, then apply it and keep Telegram's subscriptions in line.
+
+    Telegram delivers ``successful_payment`` once, and the update is acknowledged before it
+    is handled. So the update is stored first, in its own short transaction (retried a few
+    times); if applying it fails afterwards, the scheduler applies the stored row later
+    (:func:`retry_stored_payments`). Raises :class:`PaymentNotStored` if even storing fails:
+    the caller then tells the owner directly, outside the database.
+
+    Returns ``None`` for payments that are not ours, and while a stored payment waits for a
+    retry.
+    """
+    if payment_event(payment, occurred_at=occurred_at) is None:
+        log.warning("ignoring successful_payment with payload %r", payment.invoice_payload)
+        return None
+    row_id = await _store(core, payment, user_id=user_id, paid_at=occurred_at, sleep=sleep)
+    try:
+        return await apply_stored_payment(core, row_id)
+    except Exception as exc:
+        log.exception(
+            "Stars payment %s stored but not applied yet, the scheduler retries it",
+            payment.telegram_payment_charge_id,
+        )
+        await _record_failure(core, row_id, exc)
+        return None
+
+
+#: Storing a payment update is retried this many times before the owner is alerted.
+STORE_ATTEMPTS = 4
+#: Retries of a stored payment, with a delay doubling from one minute to an hour.
+APPLY_ATTEMPTS = 12
+_FIRST_RETRY = timedelta(minutes=1)
+_LONGEST_RETRY = timedelta(hours=1)
+
+
+async def _store(
+    core: Core,
+    payment: SuccessfulPayment,
+    *,
+    user_id: int,
+    paid_at: datetime,
+    sleep: Callable[[float], Awaitable[None]],
+) -> int:
+    async def work(session: AsyncSession) -> int:
+        now = core.clock.now()
+        await insert_ignore(
+            session,
+            StarsPaymentUpdate.__table__,  # type: ignore[arg-type]
+            {
+                "telegram_payment_charge_id": payment.telegram_payment_charge_id,
+                "user_id": user_id,
+                "payment": payment.model_dump(mode="json", exclude_none=True),
+                "paid_at": paid_at,
+                "status": StarsPaymentStatus.PENDING.value,
+                "attempts": 0,
+                # The handler applies it right away; the scheduler only picks up leftovers.
+                "next_attempt_at": now + _FIRST_RETRY,
+                "received_at": now,
+            },
+            ["telegram_payment_charge_id"],
+        )
+        row_id = await session.scalar(
+            select(StarsPaymentUpdate.id).where(
+                StarsPaymentUpdate.telegram_payment_charge_id == payment.telegram_payment_charge_id
+            )
+        )
+        assert row_id is not None
+        return row_id
+
+    for attempt in range(1, STORE_ATTEMPTS + 1):
+        try:
+            return await in_transaction(core.sessions, work)
+        except Exception:
+            if attempt == STORE_ATTEMPTS:
+                log.critical(
+                    "Stars payment NOT stored: charge %s, payload %r, %s XTR, user %s, expires %s",
+                    payment.telegram_payment_charge_id,
+                    payment.invoice_payload,
+                    payment.total_amount,
+                    user_id,
+                    payment.subscription_expiration_date,
+                    exc_info=True,
+                )
+                raise PaymentNotStored(payment, user_id) from None
+            log.warning("storing Stars payment failed (%s/%s), retrying", attempt, STORE_ATTEMPTS)
+            await sleep(0.5 * 2 ** (attempt - 1))
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+async def apply_stored_payment(core: Core, row_id: int) -> ApplyResult | None:
+    """Apply a stored payment update (once: an applied row is a duplicate).
 
     * A first payment that pays for a period replaces the Telegram subscription stored on the
       member's subscription (paying again after a missed renewal starts a new one); the old
@@ -301,12 +418,15 @@ async def handle_successful_payment(
       core with an owner alert; its Telegram subscription is cancelled so it does not keep
       charging every month.
     """
-    event = payment_event(payment, occurred_at=occurred_at)
-    if event is None:
-        log.warning("ignoring successful_payment with payload %r", payment.invoice_payload)
-        return None
+    async with core.sessions() as session:
+        row = await session.get(StarsPaymentUpdate, row_id)
+        assert row is not None
+        payment = SuccessfulPayment.model_validate(row.payment)
+        user_id, paid_at = row.user_id, row.paid_at
+    event = payment_event(payment, occurred_at=paid_at)
+    assert event is not None  # checked when it was stored
+    assert event.subscription_id is not None
     sub_id = event.subscription_id
-    assert sub_id is not None  # always read from our payload
     first = event.purpose is PaymentPurpose.CHECKOUT
     previous_charge: str | None = None
     if first:
@@ -314,44 +434,112 @@ async def handle_successful_payment(
             sub = await session.get(Subscription, sub_id)
             if sub is not None and sub.provider == PROVIDER_NAME:
                 previous_charge = sub.payment_method_id
-    try:
-        result = await apply_event(core, event)
-    except Exception:
-        # Polling acknowledges the update even if this raises; keep everything needed to
-        # apply the payment by hand.
-        log.exception(
-            "Stars payment NOT applied: charge %s, payload %r, %s XTR, user %s, expires %s",
-            payment.telegram_payment_charge_id,
-            payment.invoice_payload,
-            payment.total_amount,
-            user_id,
-            payment.subscription_expiration_date,
-        )
-        raise
+
+    async def work(session: AsyncSession) -> ApplyResult:
+        result = await apply_payment_event(session, event, core)
+        stored = await session.get(StarsPaymentUpdate, row_id, populate_existing=True)
+        assert stored is not None
+        stored.status = StarsPaymentStatus.APPLIED
+        stored.applied_at = core.clock.now()
+        return result
+
+    result = await in_transaction(core.sessions, work)
+    log.info(
+        "Stars payment %s -> %s (subscription %s)",
+        event.provider_payment_id,
+        result.outcome.value,
+        result.subscription_id,
+    )
     if not first or event.payment_method_id is None:
         return result
 
-    provider = core.providers.get(PROVIDER_NAME)
     stale: str | None = None
     if result.outcome is PaymentOutcome.APPLIED:
         if previous_charge is not None and previous_charge != event.payment_method_id:
             stale = previous_charge
     elif result.outcome is not PaymentOutcome.DUPLICATE:
         stale = event.payment_method_id
+    provider = core.providers.get(PROVIDER_NAME)
     if stale is not None:
         if provider is None:
             log.error("cannot cancel Stars subscription %s: provider not registered", stale)
         else:
-            ref = ProviderSubscriptionRef(sub_id, user_id, stale)
             try:
-                await provider.cancel(ref)
+                await provider.cancel(ProviderSubscriptionRef(sub_id, user_id, stale))
             except ProviderError:
                 log.exception("could not cancel Stars subscription %s of %s", stale, user_id)
     return result
 
 
+async def _record_failure(core: Core, row_id: int, exc: BaseException) -> None:
+    """Note why a stored payment did not apply; give up after :data:`APPLY_ATTEMPTS`."""
+    try:
+        async with core.sessions() as session, session.begin():
+            row = await session.get(StarsPaymentUpdate, row_id, populate_existing=True)
+            if row is None or row.status is not StarsPaymentStatus.PENDING:
+                return
+            row.last_error = f"{type(exc).__name__}: {exc}"[:2000]
+            if row.attempts >= APPLY_ATTEMPTS:
+                row.status = StarsPaymentStatus.FAILED
+                await alert_owner(
+                    session,
+                    core,
+                    key=f"owner:stars_not_applied:{row.telegram_payment_charge_id}",
+                    text=f"Платёж Telegram Stars {row.telegram_payment_charge_id} от "
+                    f"пользователя {row.user_id} так и не удалось применить "
+                    f"({row.last_error[:200]}). Продлите подписку вручную или верните Stars.",
+                )
+    except Exception:
+        # The database is still down; the row stays pending and is retried.
+        log.exception("could not record the failure of Stars payment row %s", row_id)
+
+
+async def retry_stored_payments(core: Core, *, batch_size: int = 50) -> int:
+    """Apply stored Stars payments that the handler could not; returns how many were applied."""
+    now = core.clock.now()
+    async with core.sessions() as session:
+        due = (
+            await session.execute(
+                select(StarsPaymentUpdate.id, StarsPaymentUpdate.attempts)
+                .where(
+                    StarsPaymentUpdate.status == StarsPaymentStatus.PENDING,
+                    StarsPaymentUpdate.next_attempt_at <= now,
+                )
+                .order_by(StarsPaymentUpdate.next_attempt_at)
+                .limit(batch_size)
+            )
+        ).all()
+    applied = 0
+    for row_id, attempts in due:
+        delay = min(_FIRST_RETRY * 2**attempts, _LONGEST_RETRY)
+        async with core.sessions() as session, session.begin():
+            # Moving next_attempt_at is the claim: a second worker's update matches nothing.
+            claimed = await session.execute(
+                update(StarsPaymentUpdate)
+                .where(
+                    StarsPaymentUpdate.id == row_id,
+                    StarsPaymentUpdate.status == StarsPaymentStatus.PENDING,
+                    StarsPaymentUpdate.next_attempt_at <= now,
+                )
+                .values(next_attempt_at=now + delay, attempts=StarsPaymentUpdate.attempts + 1)
+            )
+        if claimed.rowcount != 1:  # type: ignore[attr-defined]
+            continue
+        try:
+            await apply_stored_payment(core, row_id)
+        except Exception as exc:
+            log.warning("stored Stars payment row %s still not applied: %s", row_id, exc)
+            await _record_failure(core, row_id, exc)
+        else:
+            applied += 1
+    return applied
+
+
 def create_stars_router(
-    core: Core, *, pre_checkout_timeout: float = PRE_CHECKOUT_TIMEOUT
+    core: Core,
+    *,
+    pre_checkout_timeout: float = PRE_CHECKOUT_TIMEOUT,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> Router:
     """Handlers for Stars invoices created by :class:`StarsProvider`.
 
@@ -366,16 +554,26 @@ def create_stars_router(
         await answer_pre_checkout(core, query, within=pre_checkout_timeout)
 
     @router.message(F.successful_payment.invoice_payload.startswith(PAYLOAD_PREFIX))
-    async def on_successful_payment(message: Message) -> None:
+    async def on_successful_payment(message: Message, bot: Bot) -> None:
         payment = message.successful_payment
         if payment is None or message.from_user is None:
             return
-        result = await handle_successful_payment(
-            core,
-            payment,
-            user_id=message.from_user.id,
-            occurred_at=message.date.astimezone(UTC),
-        )
+        try:
+            result = await handle_successful_payment(
+                core,
+                payment,
+                user_id=message.from_user.id,
+                occurred_at=message.date.astimezone(UTC),
+                sleep=sleep,
+            )
+        except PaymentNotStored as exc:
+            # The database is unreachable, so the outbox is too: tell the owner directly.
+            if core.settings.owner_id is not None:
+                try:
+                    await bot.send_message(chat_id=core.settings.owner_id, text=exc.owner_text())
+                except TelegramAPIError:
+                    log.exception("could not tell the owner about an unstored Stars payment")
+            raise
         if result is not None and result.outcome is PaymentOutcome.NEEDS_REFUND:
             try:
                 await message.answer(NOT_APPLIED_NOTICE)

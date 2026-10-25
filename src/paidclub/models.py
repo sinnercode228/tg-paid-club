@@ -381,6 +381,40 @@ class Checkout(Base):
     )
 
 
+class StarsPaymentStatus(StrEnum):
+    PENDING = "pending"
+    APPLIED = "applied"
+    #: Still not applied after every retry; the owner was alerted.
+    FAILED = "failed"
+
+
+class StarsPaymentUpdate(Base):
+    """A Telegram Stars ``successful_payment`` exactly as it arrived, stored before it is
+    applied.
+
+    Telegram delivers the update once and the bot acknowledges it before handling it, so a
+    database error while applying would otherwise lose the payment. The scheduler applies
+    rows that are still pending.
+    """
+
+    __tablename__ = "stars_payment_updates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    telegram_payment_charge_id: Mapped[str] = mapped_column(String(128), unique=True)
+    user_id: Mapped[int] = mapped_column(BigInteger)
+    #: ``SuccessfulPayment`` as JSON.
+    payment: Mapped[dict[str, Any]] = mapped_column(JSON)
+    paid_at: Mapped[datetime]
+    status: Mapped[StarsPaymentStatus] = mapped_column(_enum(StarsPaymentStatus))
+    attempts: Mapped[int] = mapped_column(default=0)
+    next_attempt_at: Mapped[datetime]
+    last_error: Mapped[str | None] = mapped_column(Text)
+    received_at: Mapped[datetime]
+    applied_at: Mapped[datetime | None]
+
+    __table_args__ = (Index("ix_stars_payment_updates_due", "status", "next_attempt_at"),)
+
+
 # --- notifications and access ------------------------------------------------------------------
 
 
