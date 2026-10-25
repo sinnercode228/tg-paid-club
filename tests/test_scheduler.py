@@ -22,6 +22,7 @@ from paidclub.models import (
     ChargeAttemptStatus,
     PaymentOutcome,
     PaymentStatus,
+    SubscriptionEvent,
 )
 from paidclub.money import Money
 from paidclub.payments import apply_event
@@ -75,6 +76,19 @@ async def tick(core: Core, revoker: FakeRevoker) -> TickReport:
 async def attempts(core: Core) -> list[ChargeAttempt]:
     async with core.sessions() as session:
         return list((await session.scalars(select(ChargeAttempt).order_by(ChargeAttempt.id))).all())
+
+
+async def status_log(core: Core, sub_id: int) -> list[tuple[str | None, str, str | None]]:
+    async with core.sessions() as session:
+        rows = await session.scalars(
+            select(SubscriptionEvent)
+            .where(SubscriptionEvent.subscription_id == sub_id)
+            .order_by(SubscriptionEvent.id)
+        )
+        return [
+            (row.from_status.value if row.from_status else None, row.to_status.value, row.reason)
+            for row in rows
+        ]
 
 
 def fake_of(core: Core) -> FakeProvider:
@@ -183,6 +197,12 @@ async def test_a_declined_card_goes_through_dunning_and_then_loses_access(
     assert (report.charged, report.expired, report.removed) == (0, 0, 0)
     decision = await decide_join_request(core, chat_id=CHAT_ID, telegram_id=MEMBER)
     assert decision.action == "decline"
+    assert await status_log(core, sub_id) == [
+        (None, "pending", None),
+        ("pending", "active", None),
+        ("active", "past_due", None),
+        ("past_due", "expired", "payment_failed"),
+    ]
 
 
 async def test_paying_during_grace_restores_the_subscription_and_stops_retries(
@@ -556,6 +576,15 @@ async def test_paying_after_expiry_reactivates_from_the_payment(
     clock.set(datetime(2026, 4, 5, 9, 0, tzinfo=UTC))
     assert (await tick(core, revoker)).removed == 1
     assert len(revoker.calls) == 2
+    assert await status_log(core, sub_id) == [
+        (None, "pending", None),
+        ("pending", "active", None),
+        ("active", "canceled", None),
+        ("canceled", "expired", "canceled"),
+        ("expired", "active", None),
+        ("active", "canceled", None),
+        ("canceled", "expired", "canceled"),
+    ]
 
 
 async def test_paying_an_old_subscription_while_another_is_live_needs_a_refund(

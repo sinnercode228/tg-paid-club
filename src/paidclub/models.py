@@ -13,6 +13,9 @@ The constraints carry the guarantees, code only relies on them:
   both commit a transition; the loser gets ``StaleDataError`` and retries on fresh data.
 * ``charge_attempts.idempotence_key`` and ``notifications.key`` are unique: one charge request
   per (subscription, period, attempt), one message per logical event.
+
+Every status change of a subscription is also appended to ``subscription_events`` by a
+``before_flush`` hook, whichever code path made it.
 """
 
 from __future__ import annotations
@@ -33,8 +36,10 @@ from sqlalchemy import (
     Text,
     TypeDecorator,
     UniqueConstraint,
+    event,
+    inspect,
 )
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship
 
 from paidclub.billing.base import PaymentPurpose
 from paidclub.clock import ensure_utc
@@ -165,6 +170,55 @@ class Subscription(ClaimMixin, Base):
         Index("ix_subscriptions_due", "status", "next_charge_at"),
         Index("ix_subscriptions_period_end", "status", "current_period_end"),
     )
+
+
+class SubscriptionEvent(Base):
+    """Every status change of a subscription, written automatically on flush.
+
+    Subscription rows only hold the current state (a reactivation clears ``expired_at``, a
+    resume clears ``canceled_at``), so churn and cancellation counts over time come from here.
+    """
+
+    __tablename__ = "subscription_events"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscription_id: Mapped[int] = mapped_column(ForeignKey("subscriptions.id"), index=True)
+    subscription: Mapped[Subscription] = relationship(lazy="raise")
+    member_id: Mapped[int] = mapped_column(ForeignKey("members.id"))
+    plan_code: Mapped[str] = mapped_column(String(32))
+    provider: Mapped[str] = mapped_column(String(16))
+    from_status: Mapped[SubStatus | None]
+    to_status: Mapped[SubStatus]
+    reason: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(index=True)
+
+
+@event.listens_for(Session, "before_flush")
+def _log_status_changes(session: Session, _context: object, _instances: object) -> None:
+    for obj in [*session.new, *session.dirty]:
+        if not isinstance(obj, Subscription):
+            continue
+        history = inspect(obj).attrs.status.history
+        if not history.added:
+            continue
+        before = history.deleted[0] if history.deleted else None
+        if before == obj.status:
+            continue
+        reason = None
+        if obj.status is SubStatus.EXPIRED and obj.expire_reason is not None:
+            reason = obj.expire_reason.value
+        session.add(
+            SubscriptionEvent(
+                subscription=obj,
+                member_id=obj.member_id,
+                plan_code=obj.plan_code,
+                provider=obj.provider,
+                from_status=before,
+                to_status=obj.status,
+                reason=reason,
+                created_at=obj.updated_at,
+            )
+        )
 
 
 _live = Subscription.status.in_(LIVE_STATUSES)
