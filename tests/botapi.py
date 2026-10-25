@@ -27,6 +27,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from aiogram.methods import (
     CreateChatInviteLink,
+    EditChatInviteLink,
     GetChat,
     GetChatMember,
     GetMe,
@@ -177,6 +178,15 @@ class MockedSession(BaseSession):
         if isinstance(method, CreateChatInviteLink):
             return {
                 "invite_link": f"https://t.me/+join{abs(int(method.chat_id))}",
+                "creator": me,
+                "creates_join_request": bool(method.creates_join_request),
+                "is_primary": False,
+                "is_revoked": False,
+                "name": method.name,
+            }
+        if isinstance(method, EditChatInviteLink):
+            return {
+                "invite_link": method.invite_link,
                 "creator": me,
                 "creates_join_request": bool(method.creates_join_request),
                 "is_primary": False,

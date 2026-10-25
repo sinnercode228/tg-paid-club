@@ -2,8 +2,10 @@
 
 Every club chat gets a single invite link created with ``creates_join_request=True``. It is
 created once and stored in ``club_chats``; later starts reuse it, so a link posted somewhere
-keeps working and links do not pile up in the chat settings. Whoever follows it sends a join
-request, which :mod:`paidclub.bot.join` approves or declines by subscription.
+keeps working and links do not pile up in the chat settings. Each check confirms with
+Telegram that the stored link still works (``editChatInviteLink`` with its own settings): one
+an admin revoked is replaced by a new one. Whoever follows it sends a join request, which
+:mod:`paidclub.bot.join` approves or declines by subscription.
 
 The check runs at startup and again whenever the bot's own status in a club chat changes
 (``my_chat_member``), so adding the bot as an admin after it started is enough. Problems go
@@ -87,7 +89,10 @@ async def prepare_chat(bot: Bot, core: Core, chat_id: int) -> ChatCheck:
                     "тех, у кого закончилась подписка"
                 )
 
-    link = await _stored_link(core, chat_id)
+    stored = await _stored_link(core, chat_id)
+    link = stored
+    if link is not None and can_invite:
+        link = await _still_valid(bot, chat_id, link)
     if link is None and can_invite:
         try:
             created = await bot.create_chat_invite_link(
@@ -108,7 +113,8 @@ async def prepare_chat(bot: Bot, core: Core, chat_id: int) -> ChatCheck:
         else:
             if title is not None:
                 row.title = title
-            if row.invite_link is None:
+            if row.invite_link is None or link != stored:
+                # A new link, or none: the stored one was revoked and could not be replaced.
                 row.invite_link = link
             row.updated_at = now
         if problems and core.settings.owner_id is not None:
@@ -129,6 +135,26 @@ async def prepare_chat(bot: Bot, core: Core, chat_id: int) -> ChatCheck:
     if can_remove:
         await requeue_removals(core, chat_id)
     return ChatCheck(chat_id, title, link, tuple(problems), can_remove)
+
+
+async def _still_valid(bot: Bot, chat_id: int, link: str) -> str | None:
+    """``link`` if Telegram still has it as a working join-request link, otherwise ``None``.
+
+    Editing the link with its own settings answers both questions: it fails or comes back
+    revoked when an admin revoked it, and it switches join requests back on if someone
+    turned them off.
+    """
+    try:
+        edited = await bot.edit_chat_invite_link(
+            chat_id=chat_id, invite_link=link, name=INVITE_LINK_NAME, creates_join_request=True
+        )
+    except TelegramBadRequest as exc:
+        log.warning("invite link of chat %s is no longer usable: %s", chat_id, exc.message)
+        return None
+    if edited.is_revoked:
+        log.warning("invite link of chat %s was revoked", chat_id)
+        return None
+    return edited.invite_link
 
 
 async def _stored_link(core: Core, chat_id: int) -> str | None:

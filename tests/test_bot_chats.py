@@ -8,6 +8,7 @@ from aiogram import Bot
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.methods import (
     CreateChatInviteLink,
+    EditChatInviteLink,
     GetChat,
     GetChatMember,
     SetMyCommands,
@@ -94,6 +95,12 @@ async def test_startup_creates_one_join_request_link_and_reuses_it(
 
     await on_startup(bot, core)  # a restart
     assert len(session.calls(CreateChatInviteLink)) == 1
+    [check] = session.calls(EditChatInviteLink)  # still there, still by join request
+    assert (check.invite_link, check.name, check.creates_join_request) == (
+        "https://t.me/+join1001234567890",
+        INVITE_LINK_NAME,
+        True,
+    )
     assert await owner_alerts(core) == []
 
 
@@ -208,3 +215,58 @@ async def test_membership_changes_in_other_chats_are_ignored(
     dp = create_dispatcher(core)
     await feed(dp, bot, my_chat_member_update(-100777, chat_admin({})))
     assert session.requests == []
+
+
+def revoked(link: str) -> dict[str, Any]:
+    return {
+        "invite_link": link,
+        "creator": BOT_USER,
+        "creates_join_request": True,
+        "is_primary": False,
+        "is_revoked": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["revoked", "bad request"],
+)
+async def test_a_link_an_admin_revoked_is_replaced(
+    core: Core, bot: Bot, session: MockedSession, answer: str
+) -> None:
+    await prepare_club_chats(bot, core)
+    old = "https://t.me/+join1001234567890"
+    if answer == "revoked":
+        session.add_result(EditChatInviteLink, revoked(old))
+    else:
+        session.add_error(EditChatInviteLink, 400, "Bad Request: INVITE_HASH_EXPIRED")
+    new = {
+        "invite_link": "https://t.me/+fresh",
+        "creator": BOT_USER,
+        "creates_join_request": True,
+        "is_primary": False,
+        "is_revoked": False,
+    }
+    session.add_result(CreateChatInviteLink, new)
+
+    [check] = await prepare_club_chats(bot, core)
+
+    assert check.invite_link == "https://t.me/+fresh"
+    assert len(session.calls(CreateChatInviteLink)) == 2
+    async with core.sessions() as db:
+        assert await invite_links(db) == [("Клуб", "https://t.me/+fresh")]
+
+
+async def test_a_revoked_link_that_cannot_be_replaced_is_not_offered(
+    core: Core, bot: Bot, session: MockedSession
+) -> None:
+    await prepare_club_chats(bot, core)
+    session.add_result(EditChatInviteLink, revoked("https://t.me/+join1001234567890"))
+    session.add_error(CreateChatInviteLink, 400, "Bad Request: CHAT_ADMIN_REQUIRED")
+
+    [check] = await prepare_club_chats(bot, core)
+
+    assert check.invite_link is None
+    async with core.sessions() as db:
+        assert await invite_links(db) == []
+    assert any("ссылку-приглашение" in alert for alert in await owner_alerts(core))
