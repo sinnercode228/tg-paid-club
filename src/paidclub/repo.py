@@ -63,7 +63,10 @@ async def upsert_member(
     now: datetime,
     username: str | None = None,
     first_name: str | None = None,
+    in_private_chat: bool = True,
 ) -> Member:
+    """Create or refresh a member. ``in_private_chat=False`` for updates that do not prove the
+    member can receive messages (a join request), so a recorded block is kept."""
     member = await member_by_telegram_id(session, telegram_id)
     if member is None:
         member = Member(
@@ -76,8 +79,9 @@ async def upsert_member(
         member.username = username
     if first_name is not None and member.first_name != first_name:
         member.first_name = first_name
-    # Talking to the bot again means it is no longer blocked.
-    member.bot_blocked_at = None
+    if in_private_chat:
+        # Writing to the bot again means it is no longer blocked.
+        member.bot_blocked_at = None
     return member
 
 

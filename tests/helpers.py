@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from sqlalchemy import select
 
 from paidclub import club
+from paidclub.access import RevokeOutcome
 from paidclub.billing.base import (
     ChargeResult,
     Checkout,
@@ -23,6 +24,22 @@ from paidclub.payments import apply_event
 OWNER_ID = 1000
 ADMIN_ID = 1001
 CHAT_ID = -1001234567890
+
+
+class FakeRevoker:
+    """Records removals; per-user outcomes and transient failures can be scripted."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int]] = []
+        self.outcomes: dict[int, RevokeOutcome] = {}
+        self.failures: dict[int, int] = {}
+
+    async def revoke(self, chat_id: int, user_id: int) -> RevokeOutcome:
+        self.calls.append((chat_id, user_id))
+        if self.failures.get(user_id, 0) > 0:
+            self.failures[user_id] -= 1
+            raise ConnectionError("network is down")
+        return self.outcomes.get(user_id, RevokeOutcome.REMOVED)
 
 
 class RecordingSender:

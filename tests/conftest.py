@@ -11,7 +11,7 @@ from paidclub.billing.fake import FakeProvider
 from paidclub.clock import FakeClock
 from paidclub.config import Settings
 from paidclub.container import Core, build_core
-from tests.helpers import ADMIN_ID, CHAT_ID, OWNER_ID, RecordingSender
+from tests.helpers import ADMIN_ID, CHAT_ID, OWNER_ID, FakeRevoker, RecordingSender
 
 #: The 31st on purpose: month arithmetic has to clamp (Feb 28) and then come back (Mar 31).
 START = datetime(2026, 1, 31, 9, 0, tzinfo=UTC)
@@ -52,6 +52,11 @@ async def core(settings: Settings, clock: FakeClock) -> AsyncIterator[Core]:
 @pytest.fixture
 def fake(core: Core) -> FakeProvider:
     return cast(FakeProvider, core.providers.require("fake"))
+
+
+@pytest.fixture
+def revoker() -> FakeRevoker:
+    return FakeRevoker()
 
 
 @pytest.fixture
