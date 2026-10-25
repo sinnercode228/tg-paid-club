@@ -333,3 +333,38 @@ def my_chat_member_update(
             "new_chat_member": {**new_member, "user": bot_user},
         },
     }
+
+
+def chat_member_update(
+    chat_id: int,
+    user_id: int,
+    *,
+    old: str = "left",
+    new: str = "member",
+    new_member: dict[str, Any] | None = None,
+    by_user_id: int | None = None,
+    via_join_request: bool = False,
+    invite_link: str | None = None,
+    title: str = "Клуб",
+) -> dict[str, Any]:
+    """``user_id``'s membership in ``chat_id`` changed from status ``old`` to ``new`` (or to
+    ``new_member``, a whole ``ChatMember`` such as :func:`chat_admin` builds)."""
+    member = user(user_id)
+    update: dict[str, Any] = {
+        "chat": {"id": chat_id, "type": "supergroup", "title": title},
+        "from": user(by_user_id if by_user_id is not None else user_id),
+        "date": 1767225600,
+        "old_chat_member": {"status": old, "user": member},
+        "new_chat_member": {**(new_member or {"status": new}), "user": member},
+    }
+    if via_join_request:
+        update["via_join_request"] = True
+    if invite_link is not None:
+        update["invite_link"] = {
+            "invite_link": invite_link,
+            "creator": {"id": 1, "is_bot": False, "first_name": "Admin"},
+            "creates_join_request": False,
+            "is_primary": True,
+            "is_revoked": False,
+        }
+    return {"update_id": next(_update_ids), "chat_member": update}

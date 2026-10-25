@@ -160,6 +160,39 @@ async def decide_join_request(
     return decision
 
 
+async def may_stay(
+    core: Core,
+    *,
+    chat_id: int,
+    telegram_id: int,
+    username: str | None = None,
+    first_name: str | None = None,
+) -> JoinDecision:
+    """Someone joined a club chat: may they stay?
+
+    The join request is the gate, but there are ways around it: another invite link, a
+    member adding a friend, an admin adding someone. Members with access stay, as do the
+    owner and the admins; anyone else is removed by the caller.
+    """
+    if chat_id not in core.settings.club_chat_ids:
+        return JoinDecision("ignore", reason="not a club chat")
+    if telegram_id in core.settings.protected_user_ids:
+        return JoinDecision("approve", reason="owner or admin")
+    async with core.sessions() as session, session.begin():
+        member = await upsert_member(
+            session,
+            telegram_id=telegram_id,
+            username=username,
+            first_name=first_name,
+            now=core.clock.now(),
+            in_private_chat=False,
+        )
+        sub = await access_subscription(session, core, member.id)
+    if sub is not None:
+        return JoinDecision("approve", sub.id, reason=sub.status.value)
+    return JoinDecision("decline", reason="joined without a subscription")
+
+
 @dataclass
 class RevokeReport:
     subscriptions: int = 0

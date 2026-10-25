@@ -457,6 +457,8 @@ class AccessEventKind(StrEnum):
     #: Telegram did not accept the approve or decline, even after retries.
     JOIN_FAILED = "join_failed"
     REMOVED = "removed"
+    #: Joined without a join request (another link, added by someone) and without access.
+    REMOVED_ON_JOIN = "removed_on_join"
     NOT_PARTICIPANT = "not_participant"
     SKIPPED_ADMIN = "skipped_admin"
     SKIPPED_HAS_ACCESS = "skipped_has_access"

@@ -13,6 +13,7 @@ from aiogram.methods import (
     GetChatMember,
     SetMyCommands,
     TelegramMethod,
+    UnbanChatMember,
 )
 from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeChat
 
@@ -24,7 +25,7 @@ from paidclub.bot.chats import INVITE_LINK_NAME, prepare_club_chats
 from paidclub.clock import FakeClock
 from paidclub.config import Settings
 from paidclub.container import Core, build_core
-from paidclub.models import ClubChat
+from paidclub.models import AccessEventKind, ClubChat
 from paidclub.repo import invite_links
 from paidclub.scheduler import Scheduler
 from tests.botapi import (
@@ -32,10 +33,19 @@ from tests.botapi import (
     TEST_TOKEN,
     MockedSession,
     chat_admin,
+    chat_member_update,
     feed,
     my_chat_member_update,
 )
-from tests.helpers import CHAT_ID, OWNER_ID, FakeRevoker, load_sub, notifications, subscribe
+from tests.helpers import (
+    CHAT_ID,
+    OWNER_ID,
+    FakeRevoker,
+    access_events,
+    load_sub,
+    notifications,
+    subscribe,
+)
 
 BOT_USER = {"id": BOT_ID, "is_bot": True, "first_name": "Club"}
 
@@ -270,3 +280,94 @@ async def test_a_revoked_link_that_cannot_be_replaced_is_not_offered(
     async with core.sessions() as db:
         assert await invite_links(db) == []
     assert any("ссылку-приглашение" in alert for alert in await owner_alerts(core))
+
+
+# --- ways into the chat around the join request ------------------------------------------------
+
+
+def with_settings(base: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    return {**base, **extra}
+
+
+async def test_a_supergroup_whose_members_may_add_people_is_reported(
+    core: Core, bot: Bot, session: MockedSession
+) -> None:
+    """Telegram's default for groups: every member may add people and share the primary link,
+    and neither needs a join request."""
+    session.add_result(
+        GetChat,
+        with_settings(
+            chat("supergroup"), permissions={"can_send_messages": True, "can_invite_users": True}
+        ),
+    )
+    session.add_result(GetChatMember, chat_admin(BOT_USER))
+    [check] = await prepare_club_chats(bot, core)
+    [problem] = check.problems
+    assert "запретите добавлять участников" in problem
+
+
+async def test_a_supergroup_where_only_admins_add_people_is_fine(
+    core: Core, bot: Bot, session: MockedSession
+) -> None:
+    session.add_result(
+        GetChat, with_settings(chat("supergroup"), permissions={"can_invite_users": False})
+    )
+    session.add_result(GetChatMember, chat_admin(BOT_USER))
+    [check] = await prepare_club_chats(bot, core)
+    assert check.problems == ()
+
+
+async def test_a_public_club_chat_is_reported(core: Core, bot: Bot, session: MockedSession) -> None:
+    """A chat with a username is joined from t.me/<username> without a join request."""
+    session.add_result(GetChat, with_settings(chat("channel"), username="open_club"))
+    session.add_result(GetChatMember, chat_admin(BOT_USER))
+    [check] = await prepare_club_chats(bot, core)
+    [problem] = check.problems
+    assert "@open_club" in problem
+    [alert] = await owner_alerts(core)
+    assert "Сделайте чат частным" in alert
+
+
+async def test_the_bot_asks_telegram_for_member_joins(core: Core) -> None:
+    assert "chat_member" in create_dispatcher(core).resolve_used_update_types()
+
+
+async def test_someone_who_joins_without_access_is_removed_again(
+    core: Core, bot: Bot, session: MockedSession
+) -> None:
+    dp = create_dispatcher(core)
+    await feed(
+        dp,
+        bot,
+        chat_member_update(CHAT_ID, 4321, by_user_id=777, invite_link="https://t.me/+primary"),
+    )
+
+    assert session.api_methods() == ["getChatMember", "banChatMember", "unbanChatMember"]
+    [unban] = session.calls(UnbanChatMember)
+    assert (unban.user_id, unban.only_if_banned) == (4321, True)
+    [event] = await access_events(core)
+    assert (event.kind, event.telegram_id, event.chat_id) == (
+        AccessEventKind.REMOVED_ON_JOIN,
+        4321,
+        CHAT_ID,
+    )
+    assert event.detail is not None and "https://t.me/+primary" in event.detail
+    [alert] = await owner_alerts(core)
+    assert "4321" in alert and "отзовите" in alert
+
+
+async def test_members_with_access_admins_and_bots_who_join_are_left_alone(
+    core: Core, bot: Bot, session: MockedSession, fake: FakeProvider
+) -> None:
+    await subscribe(core, fake, 4322)
+    dp = create_dispatcher(core)
+    for update in (
+        chat_member_update(CHAT_ID, 4322, via_join_request=True),  # approved by the bot
+        chat_member_update(CHAT_ID, OWNER_ID),
+        chat_member_update(CHAT_ID, 4323, new_member=chat_admin({})),
+        chat_member_update(CHAT_ID, 4324, old="member", new="left"),  # leaving
+        chat_member_update(-100777, 4325),  # not a club chat
+    ):
+        await feed(dp, bot, update)
+    assert session.requests == []
+    assert await access_events(core) == []
