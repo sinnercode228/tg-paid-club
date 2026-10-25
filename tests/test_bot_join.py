@@ -7,6 +7,7 @@ from aiogram.methods import (
     AnswerChatJoinRequestQuery,
     ApproveChatJoinRequest,
     DeclineChatJoinRequest,
+    GetMe,
     SendMessage,
 )
 
@@ -14,7 +15,14 @@ from paidclub.billing.fake import FakeProvider
 from paidclub.bot.app import create_dispatcher
 from paidclub.container import Core
 from paidclub.models import AccessEventKind
-from tests.botapi import TEST_TOKEN, MockedSession, buttons_of, feed, join_request_update
+from tests.botapi import (
+    TEST_TOKEN,
+    MockedSession,
+    buttons_of,
+    feed,
+    join_request_update,
+    message_update,
+)
 from tests.helpers import CHAT_ID, OWNER_ID, access_events, notifications, subscribe
 
 MEMBER = 701
@@ -65,11 +73,18 @@ async def test_a_stranger_gets_the_plans_first_and_is_then_declined(
 ) -> None:
     await feed(dp, bot, join_request_update(CHAT_ID, MEMBER, username="guest", title="Кухня"))
     # The private chat is only open until the request is processed, so the order matters.
-    assert session.api_methods() == ["sendMessage", "declineChatJoinRequest"]
+    assert session.api_methods() == ["getMe", "sendMessage", "declineChatJoinRequest"]
     [message] = session.calls(SendMessage)
     assert message.chat_id == MEMBER  # the request's user_chat_id
     assert message.text.startswith("Чтобы вступить в «Кухня», нужна активная подписка.")
-    assert buttons_of(message)[0].text == "1 месяц — 990 ₽"
+    assert "• 1 месяц — 990 ₽" in message.text
+    # The only way on starts the bot, so the join link can reach them after paying.
+    [button] = buttons_of(message)
+    assert (button.text, button.url, button.callback_data) == (
+        "Открыть бота и выбрать тариф",
+        "https://t.me/club_bot?start=join",
+        None,
+    )
     [event] = await access_events(core)
     assert (event.kind, event.telegram_id) == (AccessEventKind.JOIN_DECLINED, MEMBER)
 
@@ -160,7 +175,12 @@ async def test_flood_control_on_the_plans_message_is_waited_out_too(
 ) -> None:
     session.add_error(SendMessage, 429, "Too Many Requests: retry after 2", retry_after=2)
     await feed(dp, bot, join_request_update(CHAT_ID, MEMBER))
-    assert session.api_methods() == ["sendMessage", "sendMessage", "declineChatJoinRequest"]
+    assert session.api_methods() == [
+        "getMe",
+        "sendMessage",
+        "sendMessage",
+        "declineChatJoinRequest",
+    ]
 
 
 async def test_an_approve_telegram_never_takes_is_recorded_and_reaches_the_owner(
@@ -204,3 +224,20 @@ async def test_a_flood_wait_longer_than_half_a_minute_is_not_waited_out(
         await feed(dp, bot, join_request_update(CHAT_ID, MEMBER))
     assert sleeps.waited == []
     assert (await access_events(core))[-1].kind is AccessEventKind.JOIN_FAILED
+
+
+async def test_without_the_bot_username_the_plans_come_as_buttons(
+    dp: Dispatcher, bot: Bot, session: MockedSession
+) -> None:
+    session.add_error(GetMe, 502, "Bad Gateway")
+    await feed(dp, bot, join_request_update(CHAT_ID, MEMBER))
+    [message] = session.calls(SendMessage)
+    assert buttons_of(message)[0].text == "1 месяц — 990 ₽"
+
+
+async def test_the_start_link_from_that_message_opens_the_plans(
+    dp: Dispatcher, bot: Bot, session: MockedSession
+) -> None:
+    await feed(dp, bot, message_update(MEMBER, "/start join"))
+    [message] = session.calls(SendMessage)
+    assert "Тарифы:" in message.text

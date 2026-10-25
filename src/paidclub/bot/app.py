@@ -91,6 +91,11 @@ def create_dispatcher(
 
 
 async def on_startup(bot: Bot, core: Core, owner_commands: Sequence[BotCommand] = ()) -> None:
+    try:
+        me = await bot.me()  # cached: the join-request message links to the bot by username
+        log.info("bot @%s is starting", me.username)
+    except TelegramAPIError as exc:
+        log.warning("could not read the bot's own profile: %s", exc.message)
     if not core.settings.club_chat_ids:
         log.warning("PAIDCLUB_CLUB_CHAT_IDS is empty: there is no chat to grant access to")
     for check in await prepare_club_chats(bot, core):

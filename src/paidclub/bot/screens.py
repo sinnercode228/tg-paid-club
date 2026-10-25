@@ -296,14 +296,37 @@ def status(
     return MessageDraft("\n".join(lines), tuple(buttons))
 
 
-def join_declined(catalog: Sequence[PlanOffers], *, chat_title: str | None) -> MessageDraft:
-    """Sent before declining a join request from someone without access."""
+#: ``/start`` payload of the button in the message to a declined join request.
+JOIN_START_PAYLOAD = "join"
+
+
+def join_declined(
+    catalog: Sequence[PlanOffers], *, chat_title: str | None, bot_username: str | None = None
+) -> MessageDraft:
+    """Sent before declining a join request from someone without access.
+
+    The bot may write to this person only now: ``user_chat_id`` works for five minutes and
+    until the request is processed. Everything later (the join link after paying, reminders)
+    needs them to have started the bot, so the button is a ``t.me/<bot>?start=`` link that
+    does exactly that, rather than plan buttons they could pay through without ever writing
+    to the bot.
+    """
     where = f"в «{chat_title}»" if chat_title else "в клуб"
+    if bot_username is None:
+        intro = (
+            f"Чтобы вступить {where}, нужна активная подписка. Оформите её здесь — после "
+            "оплаты бот пришлёт ссылку, и заявку он одобрит сразу."
+        )
+        return plans(catalog, intro=intro)
     intro = (
-        f"Чтобы вступить {where}, нужна активная подписка. Оформите её здесь — после оплаты "
-        "бот пришлёт ссылку, и заявку он одобрит сразу."
+        f"Чтобы вступить {where}, нужна активная подписка. Откройте бота кнопкой ниже и "
+        "выберите тариф — после оплаты бот пришлёт ссылку, и заявку он одобрит сразу."
     )
-    return plans(catalog, intro=intro)
+    listed = plans(catalog, intro=intro)
+    if not listed.buttons:
+        return listed  # nothing to buy right now
+    url = f"https://t.me/{bot_username}?start={JOIN_START_PAYLOAD}"
+    return MessageDraft(listed.text, (Button("Открыть бота и выбрать тариф", url=url),))
 
 
 def inline_urls(draft: MessageDraft) -> MessageDraft:

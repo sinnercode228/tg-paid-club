@@ -3,7 +3,9 @@
 The decision itself is :func:`paidclub.access.decide_join_request` (it is also logged there).
 On a decline the bot first messages the person the plans: the Bot API allows writing to
 ``user_chat_id`` only for five minutes and only until the request is processed, so the order
-matters. A failed message never blocks the decline.
+matters. Its button opens the bot with ``/start``, so the person has written to the bot by
+the time they pay, and the join link can reach them. A failed message never blocks the
+decline.
 
 Telegram delivers a join request once, and the Bot API has no way to list pending ones, so
 every call is retried through flood control (429) and network or server errors
@@ -93,7 +95,13 @@ async def on_join_request(
         decision.reason,
     )
     if decision.action == "decline":
-        draft = screens.join_declined(catalog(core), chat_title=request.chat.title)
+        try:
+            username = (await bot.me()).username  # cached after the first call
+        except TelegramAPIError:
+            username = None
+        draft = screens.join_declined(
+            catalog(core), chat_title=request.chat.title, bot_username=username
+        )
         try:
             await with_retries(lambda: show(bot, request.user_chat_id, draft), sleep=sleep)
         except TelegramAPIError as exc:
