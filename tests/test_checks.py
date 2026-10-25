@@ -272,3 +272,35 @@ def test_the_fake_provider_on_localhost_or_without_chats_is_the_demo() -> None:
 def test_the_docker_image_runs_in_prod_mode() -> None:
     """prod refuses the fake provider; the image must not run as a demo by default."""
     assert "ENV PAIDCLUB_ENV=prod" in (ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+
+# --- the dashboard secret ----------------------------------------------------------------------
+
+PROD_CLUB: dict[str, Any] = {
+    **PUBLIC_CLUB,
+    "env": "prod",
+    "providers": ["yookassa"],
+    "yookassa_shop_id": "1",
+    "yookassa_secret_key": "k",
+    "admin_token": None,
+}
+
+
+@pytest.mark.parametrize("field", ["admin_password", "admin_token"])
+def test_prod_refuses_a_guessable_dashboard_secret(field: str) -> None:
+    """/admin and its CSV export hold every member's Telegram id, username and name, behind a
+    login without an attempt limit. 'demo' is what the Makefile uses for the local demo."""
+    [error] = errors(make(**{**PROD_CLUB, field: "demo"}))
+    assert error.startswith(f"PAIDCLUB_{field.upper()} is shorter than 16 characters")
+    assert errors(make(**{**PROD_CLUB, field: "x" * 16})) == []
+
+
+def test_a_short_dashboard_secret_is_only_a_warning_outside_prod() -> None:
+    public = make(**{**PUBLIC_CLUB, "admin_password": "1234", "providers": ["stars"]})
+    assert errors(public) == []
+    assert any(
+        p.severity == "warning" and "PAIDCLUB_ADMIN_PASSWORD is shorter" in p.message
+        for p in startup_problems(public, "web")
+    )
+    local = make(admin_token="demo")
+    assert not [p for p in startup_problems(local, "web") if "shorter" in p.message]

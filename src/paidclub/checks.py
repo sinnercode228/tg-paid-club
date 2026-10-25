@@ -5,8 +5,9 @@
   integer``), instead of a pydantic traceback. Values are never echoed: some are secrets.
 * :func:`startup_problems` lists what a valid configuration still lacks for a command:
   ``run`` cannot start without a bot token (an error), and a dashboard without a password is
-  only switched off (a warning). The fake provider is refused where its free payment page
-  would be reachable by strangers, unless ``PAIDCLUB_DEMO=1`` says that is the point.
+  only switched off (a warning). In prod a short dashboard secret is refused. The fake
+  provider is refused where its free payment page would be reachable by strangers, unless
+  ``PAIDCLUB_DEMO=1`` says that is the point.
 * :func:`describe` is the summary ``paidclub check`` prints.
 """
 
@@ -29,6 +30,8 @@ ENV_PREFIX = "PAIDCLUB_"
 TELEGRAM_WEBHOOK_PORTS = (443, 80, 88, 8443)
 #: Ports YooKassa delivers notifications to (HTTPS only).
 YOOKASSA_WEBHOOK_PORTS = (443, 8443)
+#: /admin has no limit on login attempts, so its token or password must not be guessable.
+MIN_ADMIN_SECRET_LENGTH = 16
 
 Command = Literal["run", "web"]
 
@@ -158,6 +161,20 @@ def startup_problems(settings: Settings, command: Command = "run") -> list[Probl
             "the /admin dashboard is off (404): set PAIDCLUB_ADMIN_TOKEN or "
             "PAIDCLUB_ADMIN_PASSWORD to open it"
         )
+    for field in ("admin_token", "admin_password"):
+        value = getattr(settings, field)
+        if not _secret_set(value) or len(value.get_secret_value()) >= MIN_ADMIN_SECRET_LENGTH:
+            continue
+        message = (
+            f"{env_name(field)} is shorter than {MIN_ADMIN_SECRET_LENGTH} characters: /admin "
+            "and its CSV export of every member do not limit login attempts, so a short "
+            "secret can be guessed. Use a random one, e.g. from "
+            "python3 -c 'import secrets; print(secrets.token_urlsafe(24))'"
+        )
+        if settings.env == "prod":
+            error(message)
+        elif not _is_local(settings.public_base_url):
+            warning(message)
     return problems
 
 
