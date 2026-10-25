@@ -12,6 +12,7 @@ States::
                      canceled ──period end──> expired
 
     expired ──paid (late payment or the "pay" button)──> active, starting from the payment
+    expired (after a cancel) ──renewal charge sent before the cancel──> canceled, next period
 
 Periods are computed from a billing anchor, never from "now": the n-th period after the anchor
 ends at ``anchor + n * plan period``. Paying late does not shift the schedule, and month ends
@@ -142,18 +143,32 @@ def payment_succeeded(
     policy: BillingPolicy,
     mode: RenewalMode,
     period_end: datetime | None = None,
+    renewal: bool = False,
 ) -> SubState:
     """Apply a successful payment for the next unpaid period (``periods_paid + 1``).
 
     ``period_end`` is set when the provider is authoritative about the period (Telegram Stars
     sends ``subscription_expiration_date``); otherwise the end follows from the anchor.
+
+    ``renewal`` marks a renewal charge rather than a payment the member made on a checkout
+    page. A renewal charge can settle after the member turned auto-renew off: it was sent
+    before the cancel, or it was still pending. It pays the period after the last paid one,
+    and auto-renew stays off, also when the subscription has expired meanwhile.
     """
     paid = state.periods_paid + 1
-    if state.status in (SubStatus.PENDING, SubStatus.EXPIRED):
+    late_after_cancel = (
+        renewal
+        and state.status is SubStatus.EXPIRED
+        and state.expire_reason is ExpireReason.CANCELED
+    )
+    restarted = state.status is SubStatus.PENDING or (
+        state.status is SubStatus.EXPIRED and not late_after_cancel
+    )
+    if restarted:
         # A first payment, or a payment after access already ended: the new period starts now.
         anchored = replace(state, anchor_at=now, anchor_periods=state.periods_paid)
         start = now
-    elif state.status in LIVE_STATUSES:
+    elif state.status in LIVE_STATUSES or late_after_cancel:
         anchored = state
         assert state.current_period_end is not None
         start = state.current_period_end
@@ -164,8 +179,7 @@ def payment_succeeded(
     if end <= start:
         raise ValueError(f"paid period would end ({end}) before it starts ({start})")
 
-    keeps_canceled = state.status is SubStatus.CANCELED
-    restarted = state.status in (SubStatus.PENDING, SubStatus.EXPIRED)
+    keeps_canceled = state.status is SubStatus.CANCELED or late_after_cancel
     return replace(
         anchored,
         status=SubStatus.CANCELED if keeps_canceled else SubStatus.ACTIVE,

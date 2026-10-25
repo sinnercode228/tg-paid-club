@@ -223,8 +223,27 @@ async def _apply_success(
     before = sub.status
     mode = core.providers.renewal_mode(sub.provider)
     state = domain.payment_succeeded(
-        state_of(sub), now=now, policy=core.policy, mode=mode, period_end=event.period_end
+        state_of(sub),
+        now=now,
+        policy=core.policy,
+        mode=mode,
+        period_end=event.period_end,
+        renewal=event.purpose is PaymentPurpose.RENEWAL,
     )
+    assert state.current_period_end is not None
+    if before is SubStatus.EXPIRED and state.current_period_end <= now:
+        # A renewal charge from before a cancel that settled only after the period it pays
+        # for was over: there is no time left to give the member.
+        payment.for_period = state.periods_paid
+        await _alert_owner(
+            session,
+            core,
+            key=f"owner:refund:{event.provider}:{event.provider_payment_id}",
+            text=f"Платёж {ref} на {event.amount.human()} пришёл после отмены автопродления "
+            f"и после конца периода, который он оплачивает. Подписка #{sub.id}, участник "
+            f"{sub.member.telegram_id}. Проверьте и при необходимости верните деньги.",
+        )
+        return PaymentOutcome.NEEDS_REFUND
     write_state(sub, state, now=now)
     if before is SubStatus.EXPIRED:
         # Removal after the next expiry must run again.
@@ -234,11 +253,18 @@ async def _apply_success(
     payment.for_period = state.periods_paid
     payment.period_start = state.current_period_start
     payment.period_end = state.current_period_end
-    assert state.current_period_end is not None
 
     plan = core.settings.plan(sub.plan_code)
     plan_title = plan.title if plan else sub.plan_code
-    if before in (SubStatus.PENDING, SubStatus.EXPIRED):
+    if before is SubStatus.EXPIRED and state.status is SubStatus.CANCELED:
+        message = texts.renewed_after_cancel(
+            plan_title=plan_title,
+            period_end=state.current_period_end,
+            invite_links=await invite_links(session),
+            tz=core.tz,
+        )
+        kind, key = "renewed", f"renewed:{sub.id}:{state.periods_paid}"
+    elif before in (SubStatus.PENDING, SubStatus.EXPIRED):
         message = texts.activated(
             plan_title=plan_title,
             period_end=state.current_period_end,

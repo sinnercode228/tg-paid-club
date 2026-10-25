@@ -25,7 +25,9 @@ means the owner's today.
     pending → active: a subscription's first payment. A member who comes back after expiry
     through a fresh checkout is a new subscription again.
 ``reactivated``
-    expired → active: a late payment on the same subscription after access ended.
+    expired → active: a late payment on the same subscription after access ended. Also
+    expired → canceled: a renewal charge sent before the member turned auto-renew off that
+    went through after access ended (access is back for that period, auto-renew stays off).
 ``first_payments`` / ``renewals``
     Applied successful payments for period 1 / for period 2 and later, whoever initiated them:
     our renewal charge, a Telegram Stars auto-renewal, or the member's "pay" button after a
@@ -145,7 +147,10 @@ class Counts:
         elif to_status is SubStatus.PAST_DUE:
             self.dunning_started += 1
         elif to_status is SubStatus.CANCELED:
-            self.cancellations += 1
+            if from_status is SubStatus.EXPIRED:
+                self.reactivated += 1
+            else:
+                self.cancellations += 1
         elif to_status is SubStatus.EXPIRED:
             self.churned += 1
             if reason == ExpireReason.CANCELED.value:

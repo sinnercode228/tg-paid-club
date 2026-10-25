@@ -69,6 +69,22 @@ def activated(
     return MessageDraft(f"{head}\n\n{_join_hint(invite_links)}", _join_buttons(invite_links))
 
 
+def renewed_after_cancel(
+    *,
+    plan_title: str,
+    period_end: datetime,
+    invite_links: Sequence[tuple[str | None, str]],
+    tz: tzinfo,
+) -> MessageDraft:
+    """A renewal charge sent before the member turned auto-renew off went through later."""
+    head = (
+        f"Списание за продление подписки «{plan_title}», начатое до отключения автопродления, "
+        f"всё-таки прошло: доступ к клубу открыт до {fmt_date(period_end, tz)}. "
+        "Автопродление остаётся выключенным, больше списаний не будет."
+    )
+    return MessageDraft(f"{head}\n\n{_join_hint(invite_links)}", _join_buttons(invite_links))
+
+
 def renewed(*, plan_title: str, amount: Money, period_end: datetime, tz: tzinfo) -> MessageDraft:
     return MessageDraft(
         f"Подписка «{plan_title}» продлена до {fmt_date(period_end, tz)}. "

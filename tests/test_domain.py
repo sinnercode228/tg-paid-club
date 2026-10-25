@@ -245,6 +245,40 @@ def test_paying_after_expiry_starts_a_new_period_from_the_payment() -> None:
     assert again.activated_at == T0
 
 
+def test_a_renewal_charge_that_settles_after_cancel_and_expiry_keeps_auto_renew_off() -> None:
+    # Declined at the period end, the member cancels while the retry is pending (past_due ->
+    # expired), then the retry is approved: it pays period 2 as scheduled, auto-renew stays off.
+    state = paid(pending(), T0)
+    end = state.current_period_end
+    assert end is not None
+    failed = d.charge_failed(state, now=end, policy=POLICY)
+    expired = d.cancel(failed, now=end + DAY)
+    assert (expired.status, expired.expire_reason) == (SubStatus.EXPIRED, ExpireReason.CANCELED)
+
+    late = d.payment_succeeded(
+        expired, now=end + DAY + timedelta(hours=1), policy=POLICY, mode=MERCHANT, renewal=True
+    )
+
+    assert late.status is SubStatus.CANCELED
+    assert late.next_charge_at is None
+    assert (late.current_period_start, late.current_period_end) == (
+        end,
+        datetime(2026, 3, 31, 9, 0, tzinfo=UTC),
+    )
+    assert late.canceled_at == end + DAY
+    assert (late.expired_at, late.expire_reason) == (None, None)
+
+
+def test_a_checkout_payment_after_a_cancel_and_expiry_starts_over_with_auto_renew() -> None:
+    state = paid(pending(), T0)
+    end = state.current_period_end
+    assert end is not None
+    expired = d.expire(d.cancel(state, now=T0), now=end, reason=ExpireReason.CANCELED)
+    again = d.payment_succeeded(expired, now=end + DAY, policy=POLICY, mode=MERCHANT)
+    assert again.status is SubStatus.ACTIVE
+    assert again.current_period_start == end + DAY
+
+
 TRANSITIONS: dict[str, Callable[[SubState], SubState]] = {
     "fail": lambda state: d.charge_failed(state, now=T0, policy=POLICY),
     "cancel": lambda state: d.cancel(state, now=T0),
