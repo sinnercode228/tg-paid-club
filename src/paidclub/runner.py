@@ -111,12 +111,12 @@ async def build_app(
             return ClubApp(core=core, web=create_app(core), closers=closers)
 
         bot = create_bot(settings, session=bot_session)
-        if "stars" in settings.providers:
-            core.providers.register(StarsProvider(bot))
+        # Registered even with Stars switched off in PAIDCLUB_PROVIDERS, which only decides
+        # what is sold: members who subscribed earlier are still renewed by Telegram, their
+        # payments must apply, and cancelling must still reach Telegram.
+        core.providers.register(StarsProvider(bot), sold="stars" in settings.providers)
         dispatcher = create_dispatcher(
             core,
-            # The Stars handlers are included even with Stars switched off: members who
-            # subscribed earlier are still renewed by Telegram, and those payments must apply.
             extra_routers=[create_admin_router(core), create_stars_router(core)],
             owner_commands=ADMIN_COMMANDS,
         )

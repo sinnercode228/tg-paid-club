@@ -8,9 +8,14 @@ from paidclub.container import Core
 
 
 def enabled_providers(core: Core) -> list[BillingProvider]:
-    """Registered providers, in the order the owner listed them in ``PAIDCLUB_PROVIDERS``."""
+    """The providers sold with, in the order the owner listed them in ``PAIDCLUB_PROVIDERS``.
+
+    The registry can hold more: Telegram Stars is registered whenever a bot runs, so earlier
+    Stars subscribers keep working, but it is sold only when enabled.
+    """
     order: dict[str, int] = {name: i for i, name in enumerate(core.settings.providers)}
-    return sorted(core.providers, key=lambda provider: order.get(provider.name, len(order)))
+    sold = [provider for provider in core.providers if core.providers.sold(provider.name)]
+    return sorted(sold, key=lambda provider: order.get(provider.name, len(order)))
 
 
 def catalog(core: Core) -> list[PlanOffers]:

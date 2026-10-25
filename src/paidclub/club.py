@@ -23,7 +23,7 @@ from paidclub.checkouts import track_checkout
 from paidclub.container import Core
 from paidclub.db import in_transaction
 from paidclub.domain import subscriptions as domain
-from paidclub.domain.subscriptions import InvalidTransition, SubStatus
+from paidclub.domain.subscriptions import InvalidTransition, RenewalMode, SubStatus
 from paidclub.models import Subscription
 from paidclub.money import Money
 from paidclub.repo import (
@@ -109,7 +109,8 @@ class CheckoutLink:
 
 
 def _provider(core: Core, name: str) -> BillingProvider:
-    provider = core.providers.get(name)
+    """A provider to take a new payment with (registered, and sold)."""
+    provider = core.providers.sold(name)
     if provider is None:
         raise ProviderUnavailable(f"provider {name!r} is not enabled")
     return provider
@@ -304,6 +305,10 @@ async def _toggle(
     provider = core.providers.get(provider_name)
     if provider is not None:
         await (provider.resume(ref) if enable else provider.cancel(ref))
+    elif core.providers.renewal_mode(provider_name) is RenewalMode.PROVIDER:
+        # The provider renews on its own: changing only our row would tell the member that
+        # auto-renew is off while the provider keeps charging.
+        raise ProviderUnavailable(f"provider {provider_name!r} is not registered")
 
     async def apply(session: AsyncSession) -> SubscriptionView:
         sub = await _owned(session, telegram_id, subscription_id)

@@ -17,15 +17,29 @@ class ProviderNotConfigured(LookupError):
 
 
 class ProviderRegistry:
+    """Every provider the process can talk to.
+
+    A provider can be registered without being sold (``sold=False``): Telegram Stars is
+    registered whenever a bot runs, so members who subscribed with Stars before it was
+    switched off keep getting their renewals applied and can still cancel them.
+    """
+
     def __init__(self, providers: Iterable[BillingProvider] = ()) -> None:
         self._providers: dict[str, BillingProvider] = {}
+        self._not_sold: set[str] = set()
         for provider in providers:
             self.register(provider)
 
-    def register(self, provider: BillingProvider) -> None:
+    def register(self, provider: BillingProvider, *, sold: bool = True) -> None:
         if provider.name in self._providers:
             raise ValueError(f"provider {provider.name!r} is already registered")
         self._providers[provider.name] = provider
+        if not sold:
+            self._not_sold.add(provider.name)
+
+    def sold(self, name: str) -> BillingProvider | None:
+        """The provider if new payments may be taken with it."""
+        return None if name in self._not_sold else self._providers.get(name)
 
     def get(self, name: str) -> BillingProvider | None:
         return self._providers.get(name)

@@ -19,6 +19,7 @@ from aiogram.methods import (
 )
 from aiogram.methods.base import TelegramType
 from aiogram.types import LabeledPrice, SuccessfulPayment, Update
+from pydantic import SecretStr
 
 from paidclub import club
 from paidclub.billing import stars as stars_module
@@ -43,11 +44,14 @@ from paidclub.billing.stars import (
     create_stars_router,
     payment_event,
 )
+from paidclub.bot.catalog import catalog
 from paidclub.clock import FakeClock
-from paidclub.container import Core
+from paidclub.config import Settings
+from paidclub.container import Core, build_core
 from paidclub.domain.subscriptions import SubStatus
 from paidclub.models import PaymentOutcome
 from paidclub.money import Money
+from paidclub.runner import build_app
 from paidclub.scheduler import Scheduler
 from tests.conftest import START
 from tests.helpers import FakeRevoker, load_sub, notifications, payments, subscribe
@@ -660,3 +664,59 @@ async def test_answering_pre_checkout_records_no_payment(
     await dispatcher.feed_update(bot, pre_checkout_update(payload))
     assert await payments(core) == []
     assert (await load_sub(core, sub_id)).status is SubStatus.PENDING
+
+
+# --- Stars switched off after members subscribed ---------------------------------------------
+
+
+async def test_cancel_reaches_telegram_after_stars_is_switched_off(
+    core: Core,
+    session: RecordingSession,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    clock: FakeClock,
+    settings: Settings,
+) -> None:
+    """The owner drops "stars" from PAIDCLUB_PROVIDERS. Telegram keeps renewing the members
+    who subscribed earlier, so turning auto-renew off must still reach Telegram."""
+    sub_id, _, _ = await paid_stars_subscription(core, session, dispatcher, bot, clock)
+
+    restarted = RecordingSession()
+    app = await build_app(
+        settings.model_copy(
+            update={"bot_token": SecretStr("42:TEST-TOKEN"), "providers": ["fake"]}
+        ),
+        bot_session=restarted,
+        clock=clock,
+    )
+    try:
+        assert "stars" in app.core.providers
+        assert [offer.provider for item in catalog(app.core) for offer in item.offers] == [
+            "fake",
+            "fake",
+            "fake",
+        ]
+        with pytest.raises(club.ProviderUnavailable):
+            await club.start_checkout(
+                app.core, telegram_id=STRANGER, plan_code="month", provider="stars"
+            )
+
+        view = await club.cancel(app.core, telegram_id=MEMBER, subscription_id=sub_id)
+        assert view.status is SubStatus.CANCELED
+        [stop] = restarted.of(EditUserStarSubscription)
+        assert (stop.telegram_payment_charge_id, stop.is_canceled) == ("ch_1", True)
+    finally:
+        await app.aclose()
+
+
+async def test_without_the_stars_provider_cancel_is_refused_rather_than_pretended(
+    core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot, clock: FakeClock
+) -> None:
+    sub_id, _, _ = await paid_stars_subscription(core, session, dispatcher, bot, clock)
+    bare = await build_core(core.settings, clock=clock, engine=core.engine)
+
+    with pytest.raises(club.ProviderUnavailable):
+        await club.cancel(bare, telegram_id=MEMBER, subscription_id=sub_id)
+
+    assert (await load_sub(core, sub_id)).status is SubStatus.ACTIVE
+    assert session.of(EditUserStarSubscription) == []
