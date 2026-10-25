@@ -148,6 +148,17 @@ def startup_problems(settings: Settings, command: Command = "run") -> list[Probl
             f"{settings.public_base_url}/webhooks/yookassa will not receive them, and a "
             "first payment is applied only when its notification arrives"
         )
+    if (
+        "yookassa" in settings.providers
+        and settings.yookassa_webhook_token is None
+        and not _is_local(settings.public_base_url)
+    ):
+        warning(
+            "PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN is not set: anyone can post to /webhooks/yookassa, "
+            "and checking each post costs a request to the shop API. Set it and give "
+            f"{settings.public_base_url}/webhooks/yookassa/<token> as the notification URL in "
+            "the shop settings, or let only YooKassa's addresses through at the proxy"
+        )
     if command in ("run", "web") and not settings.demo:
         for message in _fake_provider_exposed(settings):
             error(message)
@@ -251,6 +262,14 @@ def describe(settings: Settings) -> list[str]:
         f"web: listens on {settings.web_host}:{settings.web_port}, public URL "
         f"{settings.public_base_url}, /admin {admin}",
         f"providers: {', '.join(settings.providers)}",
+        *(
+            [
+                f"yookassa notification URL: {settings.public_base_url}/webhooks/yookassa"
+                + ("/<PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN>" if settings.yookassa_webhook_token else "")
+            ]
+            if "yookassa" in settings.providers
+            else []
+        ),
         f"plans: {'; '.join(plans)}",
         f"billing: grace {settings.grace_days:g} days, retries after "
         f"{days(settings.dunning_retry_days)} days, reminders "

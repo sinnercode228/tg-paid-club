@@ -33,6 +33,8 @@ TELEGRAM_WEBHOOK_PATH = "/telegram/webhook"
 RETURN_PAGE_PATH = "/paid"
 #: The Bot API's rule for ``setWebhook``'s ``secret_token``.
 TELEGRAM_SECRET_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,256}")
+#: A secret path segment of a webhook URL: URL-safe and long enough not to be guessed.
+PATH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
 #: ``<bot id>:<secret>`` as @BotFather issues it.
 BOT_TOKEN_PATTERN = re.compile(r"[0-9]+:[A-Za-z0-9_-]+")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -200,6 +202,10 @@ class Settings(BaseSettings):
     yookassa_shop_id: str | None = None
     yookassa_secret_key: SecretStr | None = None
     yookassa_api_url: str = "https://api.yookassa.ru/v3"
+    #: A secret path segment for YooKassa notifications. Set, they are accepted only at
+    #: ``{public_base_url}/webhooks/yookassa/<token>`` (the URL put in the shop settings), so a
+    #: forged notification sent anywhere else costs no request to the shop API.
+    yookassa_webhook_token: SecretStr | None = None
 
     # --- workers ---------------------------------------------------------------------------
     scheduler_interval_seconds: float = Field(default=30, gt=0)
@@ -294,6 +300,15 @@ class Settings(BaseSettings):
             return None
         if not TELEGRAM_SECRET_PATTERN.fullmatch(value.get_secret_value()):
             raise ValueError("Telegram accepts 1-256 characters: letters A-Z, a-z, digits, _ and -")
+        return value
+
+    @field_validator("yookassa_webhook_token")
+    @classmethod
+    def _check_path_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None or not value.get_secret_value():
+            return None
+        if not PATH_TOKEN_PATTERN.fullmatch(value.get_secret_value()):
+            raise ValueError("must be 16-128 characters: letters A-Z, a-z, digits, _ and -")
         return value
 
     @model_validator(mode="after")

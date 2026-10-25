@@ -304,3 +304,39 @@ def test_a_short_dashboard_secret_is_only_a_warning_outside_prod() -> None:
     )
     local = make(admin_token="demo")
     assert not [p for p in startup_problems(local, "web") if "shorter" in p.message]
+
+
+# --- the YooKassa notification URL -------------------------------------------------------------
+
+YOOKASSA_CLUB: dict[str, Any] = {
+    **PUBLIC_CLUB,
+    "providers": ["yookassa"],
+    "yookassa_shop_id": "1",
+    "yookassa_secret_key": "k",
+}
+
+
+def test_an_open_yookassa_notification_url_on_a_public_address_is_warned_about() -> None:
+    [warning] = [p for p in startup_problems(make(**YOOKASSA_CLUB)) if "WEBHOOK_TOKEN" in p.message]
+    assert warning.severity == "warning"
+    assert "https://club.example/webhooks/yookassa/<token>" in warning.message
+    assert "yookassa notification URL: https://club.example/webhooks/yookassa" in describe(
+        make(**YOOKASSA_CLUB)
+    )
+
+    guarded = make(**YOOKASSA_CLUB, yookassa_webhook_token="t" * 24)
+    assert not [p for p in startup_problems(guarded) if "WEBHOOK_TOKEN" in p.message]
+    lines = describe(guarded)
+    assert (
+        "yookassa notification URL: "
+        "https://club.example/webhooks/yookassa/<PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN>"
+    ) in lines
+    assert "t" * 24 not in "\n".join(lines)
+
+
+@pytest.mark.parametrize("token", ["short", "has/slash-0123456789", "x" * 129])
+def test_the_webhook_token_must_be_a_long_url_safe_word(
+    monkeypatch: pytest.MonkeyPatch, token: str
+) -> None:
+    [line] = errors_of(monkeypatch, yookassa_webhook_token=token)
+    assert line.startswith("PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN: must be 16-128 characters")

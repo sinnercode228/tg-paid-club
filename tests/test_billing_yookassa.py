@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,7 @@ from typing import Any
 import httpx
 import pytest
 from fastapi import FastAPI
+from pydantic import SecretStr
 
 from paidclub import club
 from paidclub.access import decide_join_request
@@ -579,6 +581,61 @@ async def test_malformed_notifications_are_rejected_without_api_calls(
     with pytest.raises(WebhookRejected):
         await yookassa.parse_webhook({}, body)
     assert api.requests == []
+
+
+WEBHOOK_TOKEN = "wh-0123456789abcdef"
+
+
+@pytest.fixture
+async def guarded_http(core: Core) -> AsyncIterator[httpx.AsyncClient]:
+    """The webhook routes with PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN set."""
+    guarded = dataclasses.replace(
+        core,
+        settings=core.settings.model_copy(
+            update={"yookassa_webhook_token": SecretStr(WEBHOOK_TOKEN)}
+        ),
+    )
+    app = FastAPI()
+    app.include_router(create_webhook_router(guarded))
+    transport = httpx.ASGITransport(app=app, client=("203.0.113.9", 40000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+async def test_with_a_webhook_token_forged_notifications_cost_no_shop_api_call(
+    api: FakeYooKassa, yookassa: YooKassaProvider, guarded_http: httpx.AsyncClient
+) -> None:
+    """Checking a notification costs a GET with the shop credentials, and the route is open to
+    anyone: a script posting made-up payment ids would spend the shop's API quota."""
+    for n in range(20):
+        forged = {
+            "type": "notification",
+            "event": "payment.succeeded",
+            "object": {"id": f"2f{n:06x}-000f-5000-8000-{n:012x}"},
+        }
+        for path in ("/webhooks/yookassa", "/webhooks/yookassa/wh-guessed-0123456789"):
+            response = await guarded_http.post(path, content=json.dumps(forged))
+            assert (response.status_code, response.json()["error"]) == (404, "not found")
+    assert api.requests == []
+
+
+async def test_with_a_webhook_token_notifications_at_the_secret_url_are_applied(
+    core: Core, api: FakeYooKassa, yookassa: YooKassaProvider, guarded_http: httpx.AsyncClient
+) -> None:
+    sub_id, payment_id = await checkout(core, api)
+    api.pay(payment_id)
+    response = await guarded_http.post(
+        f"/webhooks/yookassa/{WEBHOOK_TOKEN}", content=api.notification(payment_id)
+    )
+    assert response.json()["results"] == [{"outcome": "applied", "subscription_id": sub_id}]
+    assert (await load_sub(core, sub_id)).status is SubStatus.ACTIVE
+
+
+async def test_without_a_webhook_token_a_secret_path_is_not_accepted(
+    http: httpx.AsyncClient, yookassa: YooKassaProvider
+) -> None:
+    response = await http.post(f"/webhooks/yookassa/{WEBHOOK_TOKEN}", content=b"{}")
+    assert response.status_code == 404
 
 
 # --- renewals ----------------------------------------------------------------------------------
