@@ -522,7 +522,12 @@ def render_dashboard(
             "Неудачные списания",
             _int(totals.failed_charges),
             f"продление не прошло: {totals.dunning_started}, "
-            f"оплатили в льготный период: {totals.recovered}",
+            f"оплатили в льготный период: {totals.recovered}"
+            + (
+                f" · без автосписания: {totals.renewals_not_charged}"
+                if totals.renewals_not_charged
+                else ""
+            ),
         ),
         _tile(
             "Отключили автопродление",

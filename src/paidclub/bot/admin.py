@@ -120,6 +120,13 @@ def format_stats(report: Report, *, plans: list[PlanConfig]) -> str:
         f"Выручка: {_amounts(totals.revenue)} "
         f"({totals.payments} {plural(totals.payments, 'платёж', 'платежа', 'платежей')})",
         f"Неудачные списания: {totals.failed_charges}",
+    ]
+    if totals.renewals_not_charged:
+        lines.append(
+            f"Продления, которые нечем было списать (нет карты, способ оплаты выключен): "
+            f"{totals.renewals_not_charged}"
+        )
+    lines += [
         f"Продление не прошло: {totals.dunning_started}, "
         f"оплатили в льготный период: {totals.recovered}",
         f"Отключили автопродление: {totals.cancellations}, включили обратно: {totals.resumed}",

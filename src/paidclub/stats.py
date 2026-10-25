@@ -45,9 +45,15 @@ means the owner's today.
 ``churned``
     → expired, split into ``churned_unpaid`` (grace ran out) and ``churned_after_cancel``.
 ``failed_charges``
-    Failed payments with purpose ``renewal``. Every attempt counts, so one subscription in
-    dunning can add up to three. A Stars renewal that never arrived leaves no payment and is
-    counted only in ``dunning_started``.
+    Failed payments with purpose ``renewal`` that a provider refused: card declines, and
+    requests the provider rejected. Every attempt counts, so one subscription in dunning can
+    add up to three. A Stars renewal that never arrived leaves no payment and is counted only
+    in ``dunning_started``.
+``renewals_not_charged``
+    Renewals that were due but went to no provider, so nothing could be charged: the member
+    paid without saving a card (they renew with the "pay" button), or the subscription's
+    provider was switched off. Counted per attempt, like ``failed_charges``, and kept out of
+    it, so that number stays about real declines.
 ``failed_checkouts``
     Failed payments the member made on a checkout page (first payment or the "pay" button).
 ``revenue``
@@ -86,7 +92,7 @@ from typing import Any, Literal
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from paidclub.billing.base import PaymentPurpose
+from paidclub.billing.base import NOT_CHARGED_REASONS, PaymentPurpose
 from paidclub.config import PlanConfig
 from paidclub.container import Core
 from paidclub.domain.subscriptions import LIVE_STATUSES, ExpireReason, SubStatus
@@ -127,6 +133,7 @@ class Counts:
     churned_unpaid: int = 0
     churned_after_cancel: int = 0
     failed_charges: int = 0
+    renewals_not_charged: int = 0
     failed_checkouts: int = 0
     needs_attention: int = 0
     #: Applied revenue in minor units (kopecks, stars) per currency.
@@ -169,6 +176,7 @@ class Counts:
         for_period: int | None,
         amount_minor: int,
         currency: str,
+        failure_reason: str | None = None,
     ) -> None:
         if status is PaymentStatus.SUCCEEDED:
             if not applied:
@@ -180,7 +188,10 @@ class Counts:
             else:
                 self.first_payments += 1
         elif purpose is PaymentPurpose.RENEWAL:
-            self.failed_charges += 1
+            if failure_reason in NOT_CHARGED_REASONS:
+                self.renewals_not_charged += 1
+            else:
+                self.failed_charges += 1
         else:
             self.failed_checkouts += 1
 
@@ -472,6 +483,7 @@ async def _series(
             Payment.amount_minor,
             Payment.currency,
             Payment.plan_code,
+            Payment.failure_reason,
         ).where(Payment.created_at >= start, Payment.created_at < end)
     )
 
@@ -504,6 +516,7 @@ async def _series(
                 for_period=payment.for_period,
                 amount_minor=payment.amount_minor,
                 currency=payment.currency,
+                failure_reason=payment.failure_reason,
             )
 
     totals = Counts()

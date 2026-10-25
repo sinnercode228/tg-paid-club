@@ -43,6 +43,7 @@ MSK = ZoneInfo("Europe/Moscow")
 MARCH = datetime(2026, 3, 1, tzinfo=MSK).astimezone(UTC)
 APRIL = datetime(2026, 4, 1, tzinfo=MSK).astimezone(UTC)
 FEBRUARY = datetime(2026, 2, 1, tzinfo=MSK).astimezone(UTC)
+FEB_28_9 = datetime(2026, 2, 28, 9, 0, tzinfo=UTC)
 EVIL_NAME = '=HYPERLINK("http://evil.example","x")'
 
 
@@ -522,3 +523,37 @@ async def test_stats_follow_real_renewals_failures_and_expiry(
     assert now.mrr == {"RUB": Money.from_decimal("990.00", "RUB")}  # canceled is not MRR
     assert report.days[-1].live == now.live
     assert report.churn_rate == Decimal("0.3333")
+
+
+async def test_renewals_without_a_saved_card_are_not_counted_as_failed_charges(
+    core: Core, clock: FakeClock, fake: FakeProvider, revoker: FakeRevoker
+) -> None:
+    """A member who paid without saving a card renews with the "pay" button. Each dunning
+    attempt records a failure, but nothing was sent to a provider: those are counted on
+    their own, and «Неудачные списания» stays about real declines."""
+    await subscribe(core, fake, 201, card=None)
+    await subscribe(core, fake, 202, card="decline")
+    scheduler = Scheduler(core, revoker)
+    for moment in (FEB_28_9, FEB_28_9 + timedelta(days=1), FEB_28_9 + timedelta(days=3)):
+        clock.set(moment)
+        await scheduler.tick()
+
+    totals = (await club_report(core, days=30)).totals
+    assert (totals.failed_charges, totals.renewals_not_charged) == (3, 3)
+    assert totals.dunning_started == 2
+    assert totals.needs_attention == 0
+
+
+def test_a_disabled_provider_is_not_a_failed_charge_either() -> None:
+    counts = Counts()
+    for reason in ("provider_not_configured", "no_saved_payment_method", "card_declined"):
+        counts.add_payment(
+            status=PaymentStatus.FAILED,
+            purpose=PaymentPurpose.RENEWAL,
+            applied=False,
+            for_period=2,
+            amount_minor=99_000,
+            currency="RUB",
+            failure_reason=reason,
+        )
+    assert (counts.failed_charges, counts.renewals_not_charged) == (1, 2)
