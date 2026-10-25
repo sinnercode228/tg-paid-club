@@ -470,8 +470,8 @@ def summary(result: SimulationResult, path: Path) -> str:
             f"{totals.failed_charges} failed charges, {totals.churned} churned, revenue {revenue}",
         ]
     lines.append(
-        f"Dashboard: PAIDCLUB_DATABASE_URL=sqlite+aiosqlite:///{path} with "
-        "PAIDCLUB_ADMIN_TOKEN set, then open /admin"
+        f"Dashboard: PAIDCLUB_DATABASE_URL=sqlite+aiosqlite:///{path} "
+        "PAIDCLUB_ADMIN_TOKEN=<token> paidclub web, then open /admin"
     )
     return "\n".join(lines)
 
