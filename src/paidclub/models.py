@@ -454,6 +454,8 @@ class Notification(ClaimMixin, Base):
 class AccessEventKind(StrEnum):
     JOIN_APPROVED = "join_approved"
     JOIN_DECLINED = "join_declined"
+    #: Telegram did not accept the approve or decline, even after retries.
+    JOIN_FAILED = "join_failed"
     REMOVED = "removed"
     NOT_PARTICIPANT = "not_participant"
     SKIPPED_ADMIN = "skipped_admin"

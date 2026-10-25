@@ -19,8 +19,9 @@ link and sets the command menus. ``core`` reaches every handler as a keyword arg
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 
 from aiogram import Bot, Dispatcher, Router
 from aiogram.client.default import DefaultBotProperties
@@ -69,17 +70,19 @@ def create_dispatcher(
     *,
     extra_routers: Sequence[Router] = (),
     owner_commands: Sequence[BotCommand] = (),
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> Dispatcher:
     """A dispatcher with the club's routers.
 
     ``extra_routers`` (owner commands, Telegram Stars payments) are included first, ahead of
     the member router's catch-all text handler. ``owner_commands`` are added to the owner's
-    command menu on startup, next to the member commands.
+    command menu on startup, next to the member commands. ``sleep`` is how handlers wait out
+    Telegram's flood control (tests pass one that returns at once).
     """
     dp = Dispatcher(core=core, owner_commands=tuple(owner_commands))
     dp.include_routers(
         *extra_routers,
-        create_join_router(),
+        create_join_router(sleep=sleep),
         create_chats_router(),
         create_member_router(),
     )

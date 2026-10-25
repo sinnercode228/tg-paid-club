@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter, TelegramServerError
 from aiogram.methods import (
     AnswerChatJoinRequestQuery,
     ApproveChatJoinRequest,
@@ -15,7 +15,7 @@ from paidclub.bot.app import create_dispatcher
 from paidclub.container import Core
 from paidclub.models import AccessEventKind
 from tests.botapi import TEST_TOKEN, MockedSession, buttons_of, feed, join_request_update
-from tests.helpers import CHAT_ID, OWNER_ID, access_events, subscribe
+from tests.helpers import CHAT_ID, OWNER_ID, access_events, notifications, subscribe
 
 MEMBER = 701
 OTHER_CHAT = -1009999999999
@@ -31,9 +31,22 @@ def bot(session: MockedSession) -> Bot:
     return Bot(TEST_TOKEN, session=session)
 
 
+class Sleeps:
+    def __init__(self) -> None:
+        self.waited: list[float] = []
+
+    async def __call__(self, seconds: float) -> None:
+        self.waited.append(seconds)
+
+
 @pytest.fixture
-def dp(core: Core) -> Dispatcher:
-    return create_dispatcher(core)
+def sleeps() -> Sleeps:
+    return Sleeps()
+
+
+@pytest.fixture
+def dp(core: Core, sleeps: Sleeps) -> Dispatcher:
+    return create_dispatcher(core, sleep=sleeps)
 
 
 async def test_a_member_with_access_is_approved_without_a_message(
@@ -118,3 +131,76 @@ async def test_other_errors_while_approving_propagate(
     session.add_error(ApproveChatJoinRequest, 400, "Bad Request: CHAT_ADMIN_REQUIRED")
     with pytest.raises(TelegramBadRequest):
         await feed(dp, bot, join_request_update(CHAT_ID, MEMBER))
+
+
+async def test_flood_control_on_approve_is_waited_out_and_retried(
+    core: Core,
+    dp: Dispatcher,
+    bot: Bot,
+    session: MockedSession,
+    fake: FakeProvider,
+    sleeps: Sleeps,
+) -> None:
+    """Telegram does not deliver a join request again; a paying member must not be left in
+    the request list because of a 429 during a burst of requests."""
+    await subscribe(core, fake, MEMBER)
+    session.add_error(
+        ApproveChatJoinRequest, 429, "Too Many Requests: retry after 3", retry_after=3
+    )
+
+    await feed(dp, bot, join_request_update(CHAT_ID, MEMBER))
+
+    assert len(session.calls(ApproveChatJoinRequest)) == 2
+    assert sleeps.waited == [3]
+    assert [event.kind for event in await access_events(core)] == [AccessEventKind.JOIN_APPROVED]
+
+
+async def test_flood_control_on_the_plans_message_is_waited_out_too(
+    dp: Dispatcher, bot: Bot, session: MockedSession, sleeps: Sleeps
+) -> None:
+    session.add_error(SendMessage, 429, "Too Many Requests: retry after 2", retry_after=2)
+    await feed(dp, bot, join_request_update(CHAT_ID, MEMBER))
+    assert session.api_methods() == ["sendMessage", "sendMessage", "declineChatJoinRequest"]
+
+
+async def test_an_approve_telegram_never_takes_is_recorded_and_reaches_the_owner(
+    core: Core,
+    dp: Dispatcher,
+    bot: Bot,
+    session: MockedSession,
+    fake: FakeProvider,
+    sleeps: Sleeps,
+) -> None:
+    await subscribe(core, fake, MEMBER)
+    for _ in range(4):
+        session.add_error(ApproveChatJoinRequest, 502, "Bad Gateway")
+
+    with pytest.raises(TelegramServerError):
+        await feed(dp, bot, join_request_update(CHAT_ID, MEMBER))
+
+    assert len(session.calls(ApproveChatJoinRequest)) == 4
+    assert sleeps.waited == [1, 2, 4]
+    approved, failed = await access_events(core)
+    assert (approved.kind, failed.kind) == (
+        AccessEventKind.JOIN_APPROVED,
+        AccessEventKind.JOIN_FAILED,
+    )
+    assert failed.detail is not None and failed.detail.startswith("approve: TelegramServerError")
+    [alert] = await notifications(core, "owner_alert")
+    assert str(MEMBER) in alert.text and "вручную" in alert.text
+
+
+async def test_a_flood_wait_longer_than_half_a_minute_is_not_waited_out(
+    core: Core,
+    dp: Dispatcher,
+    bot: Bot,
+    session: MockedSession,
+    fake: FakeProvider,
+    sleeps: Sleeps,
+) -> None:
+    await subscribe(core, fake, MEMBER)
+    session.add_error(ApproveChatJoinRequest, 429, "Too Many Requests", retry_after=120)
+    with pytest.raises(TelegramRetryAfter):
+        await feed(dp, bot, join_request_update(CHAT_ID, MEMBER))
+    assert sleeps.waited == []
+    assert (await access_events(core))[-1].kind is AccessEventKind.JOIN_FAILED
