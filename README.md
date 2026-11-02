@@ -5,10 +5,11 @@ English · [Русский](README.ru.md)
 [![CI](https://github.com/sinnercode228/tg-paid-club/actions/workflows/ci.yml/badge.svg)](https://github.com/sinnercode228/tg-paid-club/actions/workflows/ci.yml)
 
 A Telegram bot that sells access to a private channel or group by subscription. Members pay by
-card through YooKassa, with Telegram Stars, or in USDT, TON and other coins through Crypto Pay
-(@CryptoBot). The bot lets them in through join requests and charges renewals with the saved
-card (YooKassa) or applies the renewals Telegram makes (Stars). Crypto cannot be charged, so a
-crypto member pays every period with a new invoice. The bot reminds members before a renewal
+card through YooKassa, with Telegram Stars, in USDT, TON and other coins through Crypto Pay
+(@CryptoBot), or in USDT straight to the owner's own TON wallet, with no payment service in
+between. The bot lets them in through join requests and charges renewals with the saved card
+(YooKassa) or applies the renewals Telegram makes (Stars). Crypto cannot be charged, so a
+crypto member pays every period with a new invoice or transfer. The bot reminds members before a renewal
 or the end of access, retries failed charges during a grace period and removes members whose
 access has ended. The owner gets `/stats` and `/export` in the
 bot and a dashboard at `/admin`. It is one Python process: aiogram 3, FastAPI and SQLAlchemy 2
@@ -76,6 +77,12 @@ reads `"status": "succeeded"` from the POST body activates anyone who can send J
 URL. Here the body is used for the payment id only. The app then calls
 `GET /v3/payments/{id}` with the shop's credentials and applies the status from that answer.
 
+**A fake token pays for the club.** Anyone can deploy a jetton called USDT, or a contract that
+claims to be a USDT wallet, and an indexer reports what such a contract claims. A bot that
+trusts the jetton master an indexer names, or watches the owner's wallet for "USDT arrived"
+notifications, lets those in. Here only successful transfers into the owner's USDT jetton
+wallet count, and the address of that wallet comes from the USDT master itself.
+
 **A crash in the middle of a charge charges twice.** A worker sends the renewal charge and
 dies before it records the answer, and the next run sends it again. Here the attempt row is
 committed before the call, and the call carries an `Idempotence-Key` built from the
@@ -110,6 +117,11 @@ fake provider differ, it says so.
      `accepted_assets: "USDT,TON"`, `payload: "paidclub:<subscription>:<period>"` and
      `expires_in`. The member gets `bot_invoice_url`, which opens the invoice in @CryptoBot,
      and pays in a coin at @CryptoBot's rate. The invoice id goes into `checkouts`.
+   - USDT on TON: an invoice in `ton_invoices` with the price in USDT units (10.00 $ is
+     10000000) and a comment unique to it, such as `PC7K3M9QX2`. The member gets a link to
+     `/ton/pay/<comment>`, a page of this app with the owner's wallet, the amount and the
+     comment to copy, a Tonkeeper link and a `ton://transfer/<wallet>?jetton=<USDT master>&amount=<units>&text=<comment>`
+     link.
    - Fake: a signed link to `/fake-checkout/<token>` on this app, a page where you choose
      whether the payment goes through and whether the card is saved for renewals.
 
@@ -136,6 +148,13 @@ fake provider differ, it says so.
      body: the invoice is fetched with `getInvoices` and its status there is applied. A lost
      webhook is caught by the same lookups as above, and an invoice that expired unpaid is
      recorded as a failed checkout. Code: [`billing/cryptopay.py`](src/paidclub/billing/cryptopay.py).
+   - USDT on TON: nothing announces the payment, so the scheduler reads the owner's USDT
+     jetton wallet with `GET /api/v3/transactions` on toncenter, once a pass while an invoice
+     is open, and matches credits to invoices by comment. Transfers with one comment add up;
+     at the price, the invoice is applied as one payment. See
+     [USDT straight to a TON wallet](#usdt-straight-to-a-ton-wallet) for what counts as a
+     credit. Code: [`billing/ton.py`](src/paidclub/billing/ton.py),
+     [`ton_payments.py`](src/paidclub/ton_payments.py).
 4. **Activation.** One transaction records the payment, moves the subscription from `pending`
    to `active` with the first period starting now, and puts "Оплата прошла" with the "Вступить
    в клуб" button into the outbox. The outbox sends it with `sendMessage`. Code:
@@ -164,10 +183,10 @@ fake provider differ, it says so.
    - Stars: Telegram charges the renewal itself and sends `successful_payment` with
      `is_recurring`. If none has arrived 60 minutes after the period end, the subscription
      goes `past_due` without retries, since there is nothing for the bot to charge.
-   - Crypto Pay: nothing can be charged. The provider answers the renewal with
+   - Crypto Pay and USDT on TON: nothing can be charged. The provider answers the renewal with
      `no_saved_payment_method` without a request, the subscription goes `past_due`, and the
      member gets "Оплаченный период закончился, а следующий не оплачен" with the pay button. A
-     new invoice paid during grace still starts the period at the old period end.
+     new invoice or transfer paid during grace still starts the period at the old period end.
 8. **A failed charge.** The subscription goes `past_due` and access stays until the end of
    the grace period. Retries run at +1 and +3 days with attempt numbers 1 and 2, each with
    its own key. The member gets "Не получилось списать …" with a "pay" button, which opens a
@@ -195,19 +214,19 @@ The state machine, the tables, one scheduler pass and every idempotency key are 
 
 ## Providers
 
-| | YooKassa | Telegram Stars | Crypto Pay | Fake (demo) |
-| --- | --- | --- | --- | --- |
-| Currency | RUB, from `price_rub` | XTR, from `price_stars` | USD, from `price_usd`, paid in the coins of `PAIDCLUB_CRYPTOPAY_ASSETS` (USDT and TON by default) at @CryptoBot's rate | RUB, from `price_rub` |
-| Plans | Any period | 30 days only: `subscription_period` must be 2592000, so only 1-month and 30-day plans can have `price_stars` | Any period | Any period |
-| Price limit | none in this code | at most 10000 Stars per period (Bot API) | none in this code | none |
-| First payment | YooKassa's page (`confirmation.type = redirect`), card saved with `save_payment_method: true` | Invoice link opened in Telegram | `createInvoice` in dollars, opened in @CryptoBot through `bot_invoice_url` | Local page `/fake-checkout/<token>` with four outcomes |
-| Renewals | Charged by the app: `payment_method_id` plus `Idempotence-Key` | Charged by Telegram, arrive as `successful_payment` with `is_recurring` | **None.** Crypto cannot be charged: every period is a new invoice the member pays, from the reminder or the pay button | Charged by the app against a "saved card" that either always pays or always declines |
-| How a payment is confirmed | Body not trusted: `GET /v3/payments/{id}` with the shop credentials | Bot updates from Telegram, with an HMAC-SHA256 signature in the invoice payload; `pre_checkout_query` checked first | HMAC-SHA-256 in `crypto-pay-api-signature` checked first, then the body is not trusted either: `getInvoices` with the app token | HMAC-SHA256 signature in `X-Fake-Signature` |
-| Missed or failed notification | Payment looked up by id for up to 48 hours | The update is stored before it is applied, and the scheduler retries one that failed to apply. Stars payments are not looked up | Invoice looked up by id until it is paid or expires (`PAIDCLUB_CRYPTOPAY_INVOICE_LIFETIME_MINUTES`) | The page sends its own notification |
-| Failed renewal | Retried 1 and 3 days after the first failure | Telegram sends nothing. A renewal missing 60 minutes after the period end counts as failed | Nothing to fail: the period end goes `past_due` with the grace period, and the pay button is sent again on the retry days | Retried like YooKassa |
-| Cancel | Our side only: there is no subscription at YooKassa | `editUserStarSubscription(is_canceled=True)` | Nothing to cancel: a member who stops paying loses access after grace | Our side only |
-| Refunds | Made by the owner in the YooKassa dashboard. `refund.succeeded` is confirmed with `GET /v3/refunds/{id}`, then auto-renew is turned off and the card forgotten | A paid invoice whose payload does not verify is refunded with `refundStarPayment`, retried for about an hour (8 attempts); the owner is alerted if it still fails. Any other refund is the owner's call; the owner is alerted when a payment needs one | Not made by the app. The owner is alerted when a payment needs one and sends the coins back from @CryptoBot | None |
-| What the shop needs | Shop id and secret key. **Autopayments work by default only in a test shop; a live shop needs a YooKassa manager to enable them.** Notifications go only to HTTPS on port 443 or 8443 | Nothing: Stars go to the bot's balance | A Crypto Pay app token from @CryptoBot (@CryptoTestnetBot for the testnet), and webhooks turned on in the app with `/webhooks/cryptopay` on a public HTTPS address. Payments land in the app's balance in @CryptoBot | Nothing. No money moves, and anyone with a link can "pay" |
+| | YooKassa | Telegram Stars | Crypto Pay | USDT on TON | Fake (demo) |
+| --- | --- | --- | --- | --- | --- |
+| Currency | RUB, from `price_rub` | XTR, from `price_stars` | USD, from `price_usd`, paid in the coins of `PAIDCLUB_CRYPTOPAY_ASSETS` (USDT and TON by default) at @CryptoBot's rate | USD, from `price_usd`, paid as the same number of USDT | RUB, from `price_rub` |
+| Plans | Any period | 30 days only: `subscription_period` must be 2592000, so only 1-month and 30-day plans can have `price_stars` | Any period | Any period | Any period |
+| Price limit | none in this code | at most 10000 Stars per period (Bot API) | none in this code | none | none |
+| First payment | YooKassa's page (`confirmation.type = redirect`), card saved with `save_payment_method: true` | Invoice link opened in Telegram | `createInvoice` in dollars, opened in @CryptoBot through `bot_invoice_url` | A page of this app, `/ton/pay/<comment>`: wallet, amount and comment to copy, Tonkeeper and `ton://` links | Local page `/fake-checkout/<token>` with four outcomes |
+| Renewals | Charged by the app: `payment_method_id` plus `Idempotence-Key` | Charged by Telegram, arrive as `successful_payment` with `is_recurring` | **None.** Crypto cannot be charged: every period is a new invoice the member pays, from the reminder or the pay button | **None,** the same way: every period is a new transfer | Charged by the app against a "saved card" that either always pays or always declines |
+| How a payment is confirmed | Body not trusted: `GET /v3/payments/{id}` with the shop credentials | Bot updates from Telegram, with an HMAC-SHA256 signature in the invoice payload; `pre_checkout_query` checked first | HMAC-SHA-256 in `crypto-pay-api-signature` checked first, then the body is not trusted either: `getInvoices` with the app token | Only successful `internal_transfer` transactions on the owner's USDT jetton wallet, whose address the USDT master gave | HMAC-SHA256 signature in `X-Fake-Signature` |
+| Missed or failed notification | Payment looked up by id for up to 48 hours | The update is stored before it is applied, and the scheduler retries one that failed to apply. Stars payments are not looked up | Invoice looked up by id until it is paid or expires (`PAIDCLUB_CRYPTOPAY_INVOICE_LIFETIME_MINUTES`) | There are no notifications: the wallet is read from a stored cursor, so a restart misses nothing | The page sends its own notification |
+| Failed renewal | Retried 1 and 3 days after the first failure | Telegram sends nothing. A renewal missing 60 minutes after the period end counts as failed | Nothing to fail: the period end goes `past_due` with the grace period, and the pay button is sent again on the retry days | As with Crypto Pay | Retried like YooKassa |
+| Cancel | Our side only: there is no subscription at YooKassa | `editUserStarSubscription(is_canceled=True)` | Nothing to cancel: a member who stops paying loses access after grace | As with Crypto Pay | Our side only |
+| Refunds | Made by the owner in the YooKassa dashboard. `refund.succeeded` is confirmed with `GET /v3/refunds/{id}`, then auto-renew is turned off and the card forgotten | A paid invoice whose payload does not verify is refunded with `refundStarPayment`, retried for about an hour (8 attempts); the owner is alerted if it still fails. Any other refund is the owner's call; the owner is alerted when a payment needs one | Not made by the app. The owner is alerted when a payment needs one and sends the coins back from @CryptoBot | Not made by the app. The owner is alerted about money that paid for nothing and sends it back from the wallet | None |
+| What the shop needs | Shop id and secret key. **Autopayments work by default only in a test shop; a live shop needs a YooKassa manager to enable them.** Notifications go only to HTTPS on port 443 or 8443 | Nothing: Stars go to the bot's balance | A Crypto Pay app token from @CryptoBot (@CryptoTestnetBot for the testnet), and webhooks turned on in the app with `/webhooks/cryptopay` on a public HTTPS address. Payments land in the app's balance in @CryptoBot | A TON wallet of the owner's, used for the club only, and a public address for the payment page. Payments land in that wallet. A toncenter API key is optional | Nothing. No money moves, and anyone with a link can "pay" |
 
 The fake provider is refused when `PAIDCLUB_ENV=prod`. `paidclub run` and `paidclub web` also
 refuse it next to a real provider, or with club chats on a public `PAIDCLUB_PUBLIC_BASE_URL`,
@@ -219,7 +238,7 @@ the invoice payloads, answers `pre_checkout_query` in time, records each payment
 `stars_payments` and `stars_refunds`. Renewals of subscriptions bought before the payloads
 were signed still apply. Code: [`billing/stars.py`](src/paidclub/billing/stars.py).
 
-All four implement one protocol in [`billing/base.py`](src/paidclub/billing/base.py): start a
+All five implement one protocol in [`billing/base.py`](src/paidclub/billing/base.py): start a
 checkout, charge a renewal, look a payment up, parse and verify a webhook, cancel, resume.
 None of them touches the database. Everything they report goes through
 `apply_payment_event` in [`payments.py`](src/paidclub/payments.py), which is the one place
@@ -229,18 +248,48 @@ Prodamus is not included. I could not confirm from Prodamus's official documenta
 official libraries how its notifications are signed, and this code does not apply a payment
 notification it cannot verify.
 
-**Next step: USDT straight to the owner's TON wallet.** With Crypto Pay the money sits in the
-app's balance in @CryptoBot until the owner withdraws it. A `ton` provider without anyone in
-between is designed but not built. Its checkout would be a
-`ton://transfer/<wallet>?jetton=<USDT master>&amount=<units>&text=<comment>` link (and the
-same as a Tonkeeper link) with a comment unique to the checkout. A scheduler step would poll
-toncenter API v3 for jetton transfers into the wallet every pass, match the comment, check that
-the jetton master is the official USDT one, apply the transfer when it covers the price
-(less does not activate, more is accepted and logged), and use the transaction hash as the
-payment id, so a transfer is applied once. Native TON would need a TON price per plan rather
-than a live rate. It is not here yet because it needs that lookup step every 30 seconds
-rather than the checkout lookups' 5 and 15 minutes, matching of toncenter's raw addresses
-against user-friendly ones, and toncenter answers I could not check against live responses.
+### USDT straight to a TON wallet
+
+With Crypto Pay the money sits in the app's balance in @CryptoBot until the owner withdraws it.
+The `ton` provider has nobody in between. Members send USDT, the jetton on TON, to the owner's
+own wallet, and the bot finds the payment on chain through toncenter's public API.
+
+**What counts as a payment.** A jetton transfer credits the recipient's *jetton wallet*, a
+contract derived from the jetton master and the owner's address. A fake jetton wallet can claim
+to be USDT in everything an indexer reports about it, so that claim is never read. Instead:
+
+- The owner's USDT jetton wallet comes from the USDT master itself: `get_wallet_address(owner)`
+  through toncenter's `POST /api/v2/runGetMethodStd`, once. It is stored in `ton_wallets` and
+  not asked for again.
+- Only transactions on that wallet count: addressed to it, an `internal_transfer`
+  (`0x178d4519`), not a bounce, finalized and not aborted. The genuine wallet code at that
+  address aborts an `internal_transfer` that does not come from the master or from another
+  genuine USDT wallet, so a successful one is real USDT.
+- The amount and the text comment come from that crediting message, as toncenter decoded it.
+  A message that only looks like a deposit (`transfer_notification` to the owner's wallet) is
+  never read.
+
+**Reading the wallet.** Each scheduler pass makes at most one request,
+`GET /api/v3/transactions?account=<jetton wallet>&start_lt=<cursor>`. It runs every
+`PAIDCLUB_TON_POLL_SECONDS` while an invoice is open, and every 5 minutes for a week after one
+was paid or expired. Otherwise nothing is asked. The cursor is stored, so a restart misses
+nothing. Every credit is stored by its transaction hash, so a transfer read twice counts once.
+Two workers never poll at once, because moving `ton_wallets.polled_at` is the claim.
+
+**The money rules.**
+
+- Transfers with the same comment add up. Below the price, the member is told how much arrived
+  and how much is left, and the invoice stays open for another
+  `PAIDCLUB_TON_INVOICE_LIFETIME_MINUTES`.
+- At the price, the invoice is applied through `apply_payment_event` as one payment of the
+  price. More is accepted, and a surplus of a cent or more is reported to the owner.
+- A transfer made after its invoice expired still counts, and the owner is told. Core decides
+  what it pays for: a period that was paid meanwhile becomes `needs_refund`.
+- The owner is also told about an invoice that expires partly paid, money for an invoice that
+  is already paid, transfers with no comment or with a comment that matches nothing, and
+  credits toncenter could not decode. Nothing that arrived is dropped silently.
+- Comments look like `PC7K3M9QX2`. A comment typed by hand matches in any case, with spaces or
+  dashes, and with `O`, `I` and `L` read as `0`, `1` and `1`.
 
 ## Quick start
 
@@ -346,8 +395,16 @@ renewals are always declined.
   @CryptoTestnetBot instead, set `PAIDCLUB_CRYPTOPAY_API_URL=https://testnet-pay.crypt.bot/api`
   and pay with testnet coins. Without a public HTTPS address the webhook does not reach a
   local bot, and a paid invoice is applied by the lookup 5 minutes after the checkout.
+- USDT on TON: set `PAIDCLUB_TON_WALLET_ADDRESS` to a wallet of yours used only for the club,
+  put `ton` in `PAIDCLUB_PROVIDERS`, and give `PAIDCLUB_PUBLIC_BASE_URL` a public address,
+  because members open the payment page from a Telegram button. The default plans have
+  `price_usd`, and the default jetton is the official USDT. A toncenter API key
+  (`PAIDCLUB_TON_API_KEY`) is optional. For the testnet, set
+  `PAIDCLUB_TON_API_URL=https://testnet.toncenter.com/api`, a testnet wallet, and the master and
+  decimals of the jetton you test with (`PAIDCLUB_TON_JETTON_MASTER`,
+  `PAIDCLUB_TON_JETTON_DECIMALS`).
 
-`PAIDCLUB_PROVIDERS=yookassa,stars,cryptopay` offers all three, in that order.
+`PAIDCLUB_PROVIDERS=yookassa,stars,cryptopay,ton` offers all four, in that order.
 
 ## Configuration
 
@@ -379,7 +436,7 @@ problem.
 | `PAIDCLUB_ADMIN_PASSWORD` | not set | Basic auth password for `/admin`. With neither it nor the token set, `/admin` answers 404. |
 | `PAIDCLUB_CHECKOUT_RETURN_URL` | not set | Where a provider sends the member after paying. The default is `{PAIDCLUB_PUBLIC_BASE_URL}/paid`, a page that sends them back to the bot and promises nothing about the payment. |
 | `PAIDCLUB_PLANS` | `month` 990 ₽, 500 ⭐ or 10 $, `quarter` 2490 ₽ or 25 $, `year` 8900 ₽ or 90 $ | JSON list of plans: `code`, `title`, `period_unit` (`month` or `day`), `period_count` (1–36), `price_rub` (a string such as `"990.00"`), `price_stars` (1-month or 30-day plans only), `price_usd` (a string such as `"10.00"`, for crypto). |
-| `PAIDCLUB_PROVIDERS` | `fake` | `yookassa`, `stars`, `cryptopay` and/or `fake`, in the order members see them. |
+| `PAIDCLUB_PROVIDERS` | `fake` | `yookassa`, `stars`, `cryptopay`, `ton` and/or `fake`, in the order members see them. |
 | `PAIDCLUB_GRACE_DAYS` | `3` | How long access lasts after a failed renewal while retries run. |
 | `PAIDCLUB_DUNNING_RETRY_DAYS` | `1,3` | Retries, in days after the first failure. Ascending, and the last one inside the grace period. |
 | `PAIDCLUB_REMINDER_DAYS` | `3,1` | Reminders, in days before a renewal or the end of access. |
@@ -394,6 +451,13 @@ problem.
 | `PAIDCLUB_CRYPTOPAY_API_URL` | `https://pay.crypt.bot/api` | Crypto Pay API base URL. `https://testnet-pay.crypt.bot/api` for the testnet, where the coins are not real. |
 | `PAIDCLUB_CRYPTOPAY_ASSETS` | `USDT,TON` | Coins an invoice can be paid with, as Crypto Pay names them (`USDT`, `TON`, `BTC`, …). The price is in dollars either way. |
 | `PAIDCLUB_CRYPTOPAY_INVOICE_LIFETIME_MINUTES` | `60` | An unpaid invoice expires after this long (1–1440), and the member asks for a new one. |
+| `PAIDCLUB_TON_WALLET_ADDRESS` | not set | Your own TON wallet that members send USDT to: `UQ…`, `EQ…` or `0:…`. Use one for the club alone, since every transfer that matches no checkout is reported to you. |
+| `PAIDCLUB_TON_API_URL` | `https://toncenter.com/api` | toncenter, with the indexer under `/v3` and get-methods under `/v2`. `https://testnet.toncenter.com/api` for the testnet. |
+| `PAIDCLUB_TON_API_KEY` | not set | toncenter API key, sent as `X-API-Key`. Without one toncenter allows about one request a second. |
+| `PAIDCLUB_TON_JETTON_MASTER` | `EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs` | The jetton members pay with: the official USDT master. Change it only on the testnet. |
+| `PAIDCLUB_TON_JETTON_DECIMALS` | `6` | Decimal places of that jetton (USDT has 6). |
+| `PAIDCLUB_TON_POLL_SECONDS` | `15` | While a TON checkout waits, the wallet is read at most this often, and at most once per scheduler pass. |
+| `PAIDCLUB_TON_INVOICE_LIFETIME_MINUTES` | `60` | A TON checkout nothing was paid for expires after this long (5–1440). A partial payment extends it by as much again. |
 | `PAIDCLUB_SCHEDULER_INTERVAL_SECONDS` | `30` | Time between scheduler passes. |
 | `PAIDCLUB_CLAIM_LEASE_SECONDS` | `300` | How long a worker owns a claimed renewal, removal or message before another worker may take it over. |
 | `PAIDCLUB_PROVIDER_RETRY_SECONDS` | `300` | After a provider error (timeout, 5xx), when the same charge is tried again. |
@@ -406,7 +470,7 @@ problem.
 ## Docker
 
 ```sh
-cp .env.example .env   # bot token, owner, club chats, admin token, yookassa, stars, cryptopay
+cp .env.example .env   # bot token, owner, club chats, admin token, and the payment providers
 docker compose up --build
 ```
 
@@ -431,7 +495,7 @@ make lint            # ruff check, ruff format --check, mypy --strict
 make test-postgres   # the same tests on PostgreSQL; every table in PG_TEST_URL is dropped
 ```
 
-590 tests, about 20 seconds on SQLite, 94% line and branch coverage. Each test gets its own
+678 tests, about 25 seconds on SQLite, 94% line and branch coverage. Each test gets its own
 SQLite file. With `PAIDCLUB_TEST_DATABASE_URL` pointing at a PostgreSQL database whose name
 contains `test`, the database tests run there instead, so `SELECT … FOR UPDATE SKIP LOCKED`
 and `ON CONFLICT` run on the real thing. The default URL of `make test-postgres` is
@@ -445,12 +509,15 @@ build. [`tests/test_docs.py`](tests/test_docs.py) fails when the configuration t
 READMEs miss a setting or show a wrong default, or when a link or a test named in the docs does not
 exist.
 
-Nothing in the tests talks to Telegram, YooKassa or Crypto Pay.
+Nothing in the tests talks to Telegram, YooKassa, Crypto Pay or toncenter.
 [`tests/botapi.py`](tests/botapi.py) is a Bot API session that answers from memory. Its results
 and errors go through aiogram's own response parsing, so handlers see the same objects and
 exceptions as in production, including `TelegramRetryAfter`. The YooKassa tests run against an
-in-memory API behind `httpx.MockTransport`, built from YooKassa's documentation, and the Crypto
-Pay tests against an in-memory Crypto Pay that signs its webhooks the way Crypto Pay does.
+in-memory API behind `httpx.MockTransport`, built from YooKassa's documentation. The Crypto Pay
+tests run against an in-memory Crypto Pay that signs its webhooks the way Crypto Pay does. The
+TON tests run against an in-memory toncenter whose transactions have the shape of real ones;
+[`tests/fixtures/toncenter_jetton_credit.json`](tests/fixtures/toncenter_jetton_credit.json) is
+a real one, trimmed.
 
 Tests worth reading before the code:
 
@@ -461,6 +528,8 @@ Tests worth reading before the code:
   `test_a_renewal_whose_answer_was_lost_is_looked_up_once_the_key_may_be_forgotten`.
 - `tests/test_billing_cryptopay.py::test_webhooks_without_a_valid_signature_are_rejected_before_any_request`
   and `test_after_the_period_end_a_new_invoice_paid_during_grace_renews_from_the_old_end`.
+- `tests/test_billing_ton.py::test_only_successful_credits_into_the_pinned_wallet_count` and
+  `test_the_same_transfer_counts_once_across_passes_and_restarts`.
 - `tests/test_cancel_during_renewal.py`: a renewal charge approved after the member cancelled.
 - `tests/test_bot_revoker.py::test_a_removal_whose_unban_was_lost_is_finished_on_retry`.
 - `tests/test_outbox.py::test_two_senders_running_together_send_each_message_once`.
@@ -506,7 +575,15 @@ Things this code does not do, or that need care before a real club runs on it.
   dollars, before Crypto Pay's fee. Refunds are sent by hand from @CryptoBot. Crypto Pay
   webhooks need a public HTTPS address; without one, a paid invoice waits for the lookup, 5
   minutes after the checkout and then every 15 minutes.
-- **No payments straight to a TON wallet** yet, see [Providers](#providers).
+- **USDT on TON trusts toncenter.** The bot reads the chain through toncenter, as most TON
+  apps do, and does not check proofs itself. A wrong or compromised indexer could report a
+  credit that never happened. Use your own API key, or point `PAIDCLUB_TON_API_URL` at an
+  indexer you run, if that matters to you.
+- **USDT on TON sees only USDT.** TON coins or other jettons sent to the wallet are not
+  detected, and nobody is told: the owner sees them in the wallet. Native TON payments are not
+  accepted, because they would need a TON price per plan. A payment is confirmed on the first
+  scheduler pass after its transaction is finalized, 30 seconds by default. Without an API key
+  toncenter allows about one request a second, which one request a pass stays well under.
 - **Refunds and revenue.** A refund made in the YooKassa dashboard turns auto-renew off and
   forgets the card, and access lasts to the period end. Revenue on the dashboard is gross:
   refunds are recorded but not subtracted.
@@ -521,8 +598,8 @@ Things this code does not do, or that need care before a real club runs on it.
 
 Before going live: set `PAIDCLUB_ENV=prod` (the Docker image already does), put HTTPS in
 front, take `fake` out of `PAIDCLUB_PROVIDERS`, set `PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN`, use a
-mainnet Crypto Pay token with the default `PAIDCLUB_CRYPTOPAY_API_URL`, and run
-`paidclub check`.
+mainnet Crypto Pay token with the default `PAIDCLUB_CRYPTOPAY_API_URL`, give USDT on TON a
+wallet used only for the club, and run `paidclub check`.
 
 ## Where is what
 
@@ -534,14 +611,15 @@ src/paidclub/
   notifications.py         outbox: enqueue in the same transaction, send once with a lease
   access.py                join-request decisions, removal of expired members
   checkouts.py             looking up checkouts whose notification did not arrive
-  billing/                 provider protocol, YooKassa, Telegram Stars, Crypto Pay, fake provider
+  ton_payments.py          USDT on TON: invoices, reading the wallet, adding transfers up
+  billing/                 provider protocol, YooKassa, Stars, Crypto Pay, TON, fake provider
   bot/                     aiogram routers: member menu, join requests, chats, owner commands
-  web/                     FastAPI: webhooks, fake checkout page, /admin, /paid, Telegram webhook
+  web/                     FastAPI: webhooks, checkout pages, /admin, /paid, Telegram webhook
   stats.py                 every number on /stats and /admin, CSV export
   simulate.py              paidclub simulate
   runner.py, cli.py        one process: bot, web, scheduler, outbox; the paidclub command
   models.py, db.py         tables, constraints, claims and transaction retries
-tests/                     pytest, with a fake Bot API session and mocked YooKassa and Crypto Pay
+tests/                     pytest, with a fake Bot API and mocked YooKassa, Crypto Pay, toncenter
 docs/architecture.md       state machine, tables, scheduler pass, idempotency keys
 ```
 

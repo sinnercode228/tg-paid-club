@@ -173,6 +173,12 @@ def startup_problems(settings: Settings, command: Command = "run") -> list[Probl
             "invoice is then applied only when it is looked up, 5 minutes after the checkout "
             "and every 15 minutes after that"
         )
+    if "ton" in settings.providers and _is_local(settings.public_base_url):
+        warning(
+            f"The TON payment page is served at {settings.public_base_url}/ton/pay/...: members "
+            "open it from a Telegram button, so PAIDCLUB_PUBLIC_BASE_URL must be an address "
+            "they can reach"
+        )
     if command in ("run", "web") and not settings.demo:
         for message in _fake_provider_exposed(settings):
             error(message)
@@ -227,7 +233,7 @@ def _fake_provider_exposed(settings: Settings) -> list[str]:
         return [
             "PAIDCLUB_PROVIDERS=fake with club chats at a public "
             f"PAIDCLUB_PUBLIC_BASE_URL ({settings.public_base_url}): anyone could join through "
-            "the demo payment page without paying. Use yookassa, stars or cryptopay, or set "
+            "the demo payment page without paying. Use yookassa, stars, cryptopay or ton, or set "
             "PAIDCLUB_DEMO=1 if this is a demo"
         ]
     return []
@@ -294,6 +300,16 @@ def describe(settings: Settings) -> list[str]:
                 f"{settings.public_base_url}/webhooks/cryptopay"
             ]
             if "cryptopay" in settings.providers
+            else []
+        ),
+        *(
+            [
+                f"ton: wallet {settings.ton_wallet_address}, jetton {settings.ton_jetton_master} "
+                f"({settings.ton_jetton_decimals} decimals), toncenter {settings.ton_api_url} "
+                f"with{'' if settings.ton_api_key else 'out'} an API key, polled every "
+                f"{settings.ton_poll_seconds:g} s while a checkout waits"
+            ]
+            if "ton" in settings.providers
             else []
         ),
         f"plans: {'; '.join(plans)}",

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
 from fastapi import APIRouter
 from fastapi.responses import HTMLResponse
@@ -78,12 +78,26 @@ button span { display: block; font-size: 13px; opacity: 0.8; margin-top: 2px; }
 .status.ok { border-color: var(--ok); } .status.ok strong { color: var(--ok); }
 .status.bad { border-color: var(--bad); } .status.bad strong { color: var(--bad); }
 .status.warn { border-color: var(--warn); } .status.warn strong { color: var(--warn); }
+.field { margin-top: 14px; }
+.field code {
+  display: block; margin-top: 4px; padding: 10px 12px; border-radius: 10px;
+  background: var(--bg); border: 1px solid var(--line); font-size: 15px;
+  overflow-wrap: anywhere; user-select: all;
+}
+.field button { margin-top: 6px; text-align: center; }
 """
 
 
 def page(
-    title: str, content: str, *, banner: str | None = None, status_code: int = 200
+    title: str,
+    content: str,
+    *,
+    banner: str | None = None,
+    status_code: int = 200,
+    head: str = "",
+    headers: Mapping[str, str] | None = None,
 ) -> HTMLResponse:
+    """A member-facing page. ``head`` goes into ``<head>`` as is (a refresh, say)."""
     top = f'<div class="banner">{html.escape(banner)}</div>\n' if banner else ""
     document = f"""<!doctype html>
 <html lang="ru">
@@ -92,13 +106,13 @@ def page(
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex">
 <title>{html.escape(title)}</title>
-<style>{STYLE}</style>
+<style>{STYLE}</style>{head}
 </head>
 <body><main>
 {top}{content}
 </main></body>
 </html>"""
-    return HTMLResponse(document, status_code=status_code)
+    return HTMLResponse(document, status_code=status_code, headers=headers)
 
 
 def render_return_page(bot_username: str | None) -> HTMLResponse:

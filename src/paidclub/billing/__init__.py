@@ -14,7 +14,7 @@ PROVIDER_RENEWED = frozenset({"stars"})
 #: renews by paying every period with a new invoice. Known by name like
 #: :data:`PROVIDER_RENEWED`; the copy members get (reminders, the "pay" message, /status)
 #: tells them so instead of talking about a card.
-MEMBER_RENEWED = frozenset({"cryptopay"})
+MEMBER_RENEWED = frozenset({"cryptopay", "ton"})
 
 
 class ProviderNotConfigured(LookupError):

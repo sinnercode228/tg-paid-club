@@ -19,6 +19,7 @@ from paidclub.billing.base import (
     CheckoutRequest,
     ProviderSubscriptionRef,
 )
+from paidclub.billing.ton import TonProvider
 from paidclub.checkouts import track_checkout
 from paidclub.container import Core
 from paidclub.db import in_transaction
@@ -35,6 +36,7 @@ from paidclub.repo import (
     upsert_member,
     write_state,
 )
+from paidclub.ton_payments import open_invoice
 
 log = logging.getLogger(__name__)
 
@@ -210,7 +212,7 @@ async def start_checkout(
             return_url=core.settings.checkout_return_url,
         )
     )
-    await _track(core, sub_id, billing.name, checkout, for_period=1)
+    await _record(core, sub_id, billing, checkout, for_period=1, amount=price)
     return CheckoutLink(sub_id, billing.name, price, checkout.url)
 
 
@@ -248,8 +250,33 @@ async def start_repayment(core: Core, *, telegram_id: int, subscription_id: int)
             return_url=core.settings.checkout_return_url,
         )
     )
-    await _track(core, subscription_id, billing.name, checkout, for_period=for_period)
+    await _record(core, subscription_id, billing, checkout, for_period=for_period, amount=price)
     return CheckoutLink(subscription_id, billing.name, price, checkout.url)
+
+
+async def _record(
+    core: Core,
+    subscription_id: int,
+    billing: BillingProvider,
+    checkout: Checkout,
+    *,
+    for_period: int,
+    amount: Money,
+) -> None:
+    """Keep what is needed to find the payment of a checkout before the member gets its link."""
+    if isinstance(billing, TonProvider) and checkout.provider_payment_id is not None:
+        # The page is served from the invoice and transfers are matched against it, so a
+        # failure here must reach the member as an error, not as a link that leads nowhere.
+        await open_invoice(
+            core,
+            billing,
+            subscription_id=subscription_id,
+            for_period=for_period,
+            comment=checkout.provider_payment_id,
+            amount=amount,
+        )
+        return
+    await _track(core, subscription_id, billing.name, checkout, for_period=for_period)
 
 
 async def _track(
