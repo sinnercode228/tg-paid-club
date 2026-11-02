@@ -27,6 +27,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from paidclub import texts
+from paidclub.billing import MEMBER_RENEWED
 from paidclub.billing.base import (
     BillingEvent,
     PaymentFailed,
@@ -450,6 +451,10 @@ async def notify_renewal_failed(
     assert sub.grace_until is not None
     if core.providers.renewal_mode(sub.provider) is RenewalMode.PROVIDER:
         message = texts.stars_renewal_missing(
+            subscription_id=sub.id, amount=price_of(sub), grace_until=sub.grace_until, tz=core.tz
+        )
+    elif sub.provider in MEMBER_RENEWED:
+        message = texts.crypto_renewal_unpaid(
             subscription_id=sub.id, amount=price_of(sub), grace_until=sub.grace_until, tz=core.tz
         )
     else:

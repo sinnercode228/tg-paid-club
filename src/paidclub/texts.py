@@ -158,6 +158,31 @@ def reminder_manual(
     )
 
 
+def reminder_crypto(
+    *, subscription_id: int, amount: Money, period_end: datetime, offset: timedelta, tz: tzinfo
+) -> MessageDraft:
+    end = fmt_date(period_end, tz)
+    return MessageDraft(
+        f"{when_phrase(offset)}, {end}, заканчивается оплаченный период. При оплате "
+        "криптовалютой подписка сама не продлевается: оплатите следующий период, чтобы не "
+        f"потерять доступ. Можно уже сейчас — он начнётся {end}, ни один день не пропадёт.",
+        (Button(f"Оплатить {amount.human()}", callback_data=callbacks.pay(subscription_id)),),
+    )
+
+
+def crypto_renewal_unpaid(
+    *, subscription_id: int, amount: Money, grace_until: datetime, tz: tzinfo
+) -> MessageDraft:
+    """The period of a crypto subscription ended unpaid; sent again at each dunning step."""
+    return MessageDraft(
+        "Оплаченный период закончился, а следующий не оплачен: при оплате криптовалютой "
+        "подписка сама не продлевается.\n"
+        f"Доступ к клубу сохранится до {fmt_date(grace_until, tz)}. Чтобы остаться в клубе, "
+        "оплатите продление:",
+        (Button(f"Оплатить {amount.human()}", callback_data=callbacks.pay(subscription_id)),),
+    )
+
+
 def reminder_canceled(
     *,
     subscription_id: int,

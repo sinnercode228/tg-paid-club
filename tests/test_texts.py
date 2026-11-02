@@ -93,6 +93,36 @@ def test_payment_failed_offers_to_pay_now_and_says_until_when_access_lasts() -> 
     assert "Автоматических попыток больше не будет" in last.text
 
 
+def test_crypto_members_are_asked_to_pay_never_told_about_a_card() -> None:
+    reminder = texts.reminder_crypto(
+        subscription_id=7,
+        amount=Money(1000, "USD"),
+        period_end=datetime(2026, 2, 28, 9, 0, tzinfo=UTC),
+        offset=timedelta(days=3),
+        tz=MSK,
+    )
+    assert reminder.text == (
+        "Через 3 дня, 28.02.2026, заканчивается оплаченный период. При оплате криптовалютой "
+        "подписка сама не продлевается: оплатите следующий период, чтобы не потерять доступ. "
+        "Можно уже сейчас — он начнётся 28.02.2026, ни один день не пропадёт."
+    )
+    assert reminder.buttons == (Button("Оплатить 10 $", callback_data="pay:7"),)
+
+    unpaid = texts.crypto_renewal_unpaid(
+        subscription_id=7,
+        amount=Money(1000, "USD"),
+        grace_until=datetime(2026, 3, 3, 9, 0, tzinfo=UTC),
+        tz=MSK,
+    )
+    assert unpaid.text.startswith("Оплаченный период закончился, а следующий не оплачен")
+    assert "сохранится до 03.03.2026" in unpaid.text
+    assert unpaid.buttons == (Button("Оплатить 10 $", callback_data="pay:7"),)
+    for message in (reminder, unpaid):
+        assert "карт" not in message.text
+        assert "Повторим" not in message.text
+        assert "списа" not in message.text
+
+
 def test_access_ended_offers_the_plans() -> None:
     message = texts.access_ended(reason=ExpireReason.CANCELED)
     assert message.buttons == (Button("Выбрать тариф", callback_data=callbacks.PLANS),)

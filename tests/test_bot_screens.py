@@ -17,6 +17,7 @@ from paidclub.notifications import Button, MessageDraft
 MSK = ZoneInfo("Europe/Moscow")
 END = datetime(2026, 2, 28, 9, 0, tzinfo=UTC)
 RUB = Money(99000, "RUB")
+USD = Money(1000, "USD")
 LINKS = [("Клуб", "https://t.me/+club")]
 
 
@@ -101,6 +102,69 @@ def test_an_active_subscription_without_a_saved_card_asks_to_pay() -> None:
     assert labels(draft) == ["Вступить в клуб", "Оплатить продление 990 ₽", "Не продлевать"]
 
 
+def test_an_active_crypto_subscription_asks_to_pay_and_has_nothing_to_switch_off() -> None:
+    draft = status(view(SubStatus.ACTIVE, provider="cryptopay", price=USD, has_saved_method=False))
+    assert draft.text.startswith(
+        "Подписка «1 месяц» активна до 28.02.2026.\n"
+        "При оплате криптовалютой подписка сама не продлевается: оплатите следующий период "
+        "до 28.02.2026, чтобы не потерять доступ.\n"
+    )
+    assert labels(draft) == ["Вступить в клуб", "Оплатить продление 10 $"]
+    assert draft.buttons[1].callback_data == Menu(go=Go.PAY, sub=7).pack()
+
+
+def test_a_crypto_subscription_in_grace_promises_no_retry() -> None:
+    draft = status(
+        view(
+            SubStatus.PAST_DUE,
+            provider="cryptopay",
+            price=USD,
+            has_saved_method=False,
+            grace_until=END + timedelta(days=3),
+            next_charge_at=END + timedelta(days=1),
+        )
+    )
+    assert draft.text.startswith(
+        "Оплаченный период подписки «1 месяц» закончился, а следующий не оплачен.\n"
+        "Доступ к клубу сохранится до 03.03.2026.\n"
+    )
+    assert "Повторим" not in draft.text
+    assert "списать" not in draft.text
+    assert labels(draft) == ["Вступить в клуб", "Оплатить 10 $"]
+
+
+def test_the_plans_say_which_ways_to_pay_renew_on_their_own() -> None:
+    month = PlanConfig(
+        code="month", title="1 месяц", price_rub=Decimal("990"), price_usd=Decimal("10")
+    )
+    card, crypto = Offer("yookassa", RUB), Offer("cryptopay", USD)
+
+    only_card = screens.plans([PlanOffers(month, (card,))]).text
+    assert only_card.endswith(screens.AUTO_RENEWAL)
+    both = screens.plans([PlanOffers(month, (card, crypto))]).text
+    assert both.endswith(f"{screens.AUTO_RENEWAL} {screens.CRYPTO_RENEWAL}")
+    assert "• 1 месяц — 990 ₽ или 10 $" in both
+    only_crypto = screens.plans([PlanOffers(month, (crypto,))]).text
+    assert only_crypto.endswith(screens.NO_AUTO_RENEWAL)
+    assert "автоматически" not in only_crypto
+
+
+def test_plan_details_explain_that_crypto_is_paid_every_period() -> None:
+    month = PlanConfig(
+        code="month", title="1 месяц", price_rub=Decimal("990"), price_usd=Decimal("10")
+    )
+    crypto = Offer("cryptopay", USD)
+    alone = screens.plan_details(PlanOffers(month, (crypto,)))
+    assert alone.text.splitlines()[:2] == [
+        "Тариф «1 месяц»: 10 $ за 1 месяц.",
+        "Каждый период оплачивается отдельно: бот заранее напомнит об оплате.",
+    ]
+    assert "• Криптовалюта — 10 $ (счёт в @CryptoBot; автопродления нет" in alone.text
+    mixed = screens.plan_details(PlanOffers(month, (Offer("yookassa", RUB), crypto)))
+    assert "пока вы не отключите автопродление" in mixed.text
+    assert labels(mixed) == ["Банковская карта — 990 ₽", "Криптовалюта — 10 $", "« Все тарифы"]
+
+
 def test_past_due_without_grace_left_has_no_join_button() -> None:
     draft = status(view(SubStatus.PAST_DUE, has_access=False, grace_until=END, next_charge_at=None))
     assert draft.text == "Продление подписки «1 месяц» не оплачено, доступ к клубу закрыт."
@@ -152,8 +216,18 @@ def test_checkout_for_the_next_period_links_back_to_the_status() -> None:
     assert draft.buttons[1].callback_data == Menu(go=Go.STATUS).pack()
 
 
+def test_a_crypto_checkout_opens_in_crypto_bot() -> None:
+    link = CheckoutLink(7, "cryptopay", USD, "https://t.me/CryptoBot?start=IV7001")
+    draft = screens.checkout(link, plan_title="1 месяц")
+    assert "Счёт откроется в @CryptoBot: цена в долларах" in draft.text
+    assert (draft.buttons[0].text, draft.buttons[0].url) == (
+        "Оплатить 10 $",
+        "https://t.me/CryptoBot?start=IV7001",
+    )
+
+
 def test_menu_callback_data_fits_telegram_limit_for_the_longest_plan_code() -> None:
-    data = Menu(go=Go.BUY, plan="x" * 32, provider="yookassa", sub=2**31).pack()
+    data = Menu(go=Go.BUY, plan="x" * 32, provider="cryptopay", sub=2**31).pack()
     assert len(data.encode()) <= 64
     assert Menu.unpack(data).plan == "x" * 32
 

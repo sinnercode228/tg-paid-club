@@ -621,6 +621,40 @@ async def test_a_renewal_has_nothing_to_charge_and_asks_crypto_pay_nothing(
     assert api.requests == []
 
 
+async def test_crypto_members_are_reminded_to_pay_and_told_when_the_period_ended_unpaid(
+    core: Core,
+    api: FakeCryptoPay,
+    cryptopay: CryptoPayProvider,
+    http: httpx.AsyncClient,
+    clock: FakeClock,
+) -> None:
+    sub_id, _ = await paid_subscription(core, api, http)
+    pay = [{"text": "Оплатить 10 $", "callback_data": f"pay:{sub_id}"}]
+    for moment in (FEB_28 - 3 * DAY, FEB_28 - DAY):
+        clock.set(moment)
+        assert (await tick(core)).reminders == 1
+    early, late = await notifications(core, "reminder")
+    assert early.text.startswith(
+        "Через 3 дня, 28.02.2026, заканчивается оплаченный период. При оплате криптовалютой "
+        "подписка сама не продлевается"
+    )
+    assert late.text.startswith("Завтра, 28.02.2026, заканчивается оплаченный период.")
+    assert early.buttons == late.buttons == pay
+
+    # The period end and the first dunning step each repeat the "pay" button; no charge is
+    # promised, because there is nothing to charge.
+    for moment in (FEB_28, FEB_28 + DAY):
+        clock.set(moment)
+        await tick(core)
+    unpaid = await notifications(core, "payment_failed")
+    assert len(unpaid) == 2
+    for message in unpaid:
+        assert message.text.startswith("Оплаченный период закончился, а следующий не оплачен")
+        assert "Доступ к клубу сохранится до 03.03.2026." in message.text
+        assert message.buttons == pay
+    assert (await load_sub(core, sub_id)).status is SubStatus.PAST_DUE
+
+
 async def test_the_next_period_can_be_paid_early_and_starts_where_the_last_one_ends(
     core: Core,
     api: FakeCryptoPay,

@@ -10,6 +10,11 @@ from paidclub.domain.subscriptions import RenewalMode
 #: Providers that renew on their own schedule. Known by name so a process that has not
 #: registered the provider (a scheduler without a bot) still treats its subscriptions right.
 PROVIDER_RENEWED = frozenset({"stars"})
+#: Providers that cannot renew at all (crypto): nothing is saved to charge, so the member
+#: renews by paying every period with a new invoice. Known by name like
+#: :data:`PROVIDER_RENEWED`; the copy members get (reminders, the "pay" message, /status)
+#: tells them so instead of talking about a card.
+MEMBER_RENEWED = frozenset({"cryptopay"})
 
 
 class ProviderNotConfigured(LookupError):

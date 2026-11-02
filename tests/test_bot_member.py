@@ -2,11 +2,14 @@ from __future__ import annotations
 
 from datetime import timedelta
 
+import httpx
 import pytest
 from aiogram import Bot, Dispatcher
 from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
 
 from paidclub import callbacks, club
+from paidclub.billing.base import PaymentSucceeded
+from paidclub.billing.cryptopay import CryptoPayProvider
 from paidclub.billing.fake import FakeProvider
 from paidclub.bot.app import create_dispatcher
 from paidclub.bot.member import GENERIC_ERROR
@@ -27,7 +30,16 @@ from tests.botapi import (
     feed,
     message_update,
 )
-from tests.helpers import FakeRevoker, StubStarsProvider, add_invite_link, load_sub, subscribe
+from tests.helpers import (
+    FakeRevoker,
+    StubStarsProvider,
+    add_invite_link,
+    load_sub,
+    notifications,
+    subscribe,
+)
+from tests.test_billing_cryptopay import TOKEN as CRYPTO_TOKEN
+from tests.test_billing_cryptopay import FakeCryptoPay
 
 MEMBER = 501
 FEB_28 = "28.02.2026"
@@ -227,6 +239,50 @@ async def test_pay_button_after_a_failed_renewal_opens_a_checkout_for_the_next_p
     assert labels(checkout) == ["Оплатить 990 ₽", "Моя подписка"]
     page = fake.read_checkout(url_of(checkout, "Оплатить 990 ₽").rsplit("/", 1)[1])
     assert (page.subscription_id, page.for_period) == (sub_id, 2)
+
+
+async def test_a_crypto_member_pays_the_next_period_from_the_reminder(
+    core: Core,
+    dp: Dispatcher,
+    bot: Bot,
+    session: MockedSession,
+    clock: FakeClock,
+) -> None:
+    api = FakeCryptoPay(clock)
+    client = httpx.AsyncClient(transport=httpx.MockTransport(api.handler))
+    provider = CryptoPayProvider(
+        api_token=CRYPTO_TOKEN, assets=["USDT"], client=client, clock=clock
+    )
+    core.providers.register(provider)
+    try:
+        link = await club.start_checkout(
+            core, telegram_id=MEMBER, plan_code="month", provider="cryptopay"
+        )
+        first = link.url.rsplit("IV", 1)[1]
+        api.pay(first)
+        [event] = await provider.parse_webhook(*api.update(first))
+        assert isinstance(event, PaymentSucceeded)
+        sub_id = (await apply_event(core, event)).subscription_id
+        assert sub_id is not None
+
+        clock.advance(timedelta(days=25))  # 25 February, three days before the period end
+        assert (await Scheduler(core, FakeRevoker()).tick()).reminders == 1
+        [reminder] = await notifications(core, "reminder")
+        assert reminder.buttons == [{"text": "Оплатить 10 $", "callback_data": f"pay:{sub_id}"}]
+
+        await tap(dp, bot, callbacks.pay(sub_id))
+        checkout = last_screen(session)
+        assert isinstance(checkout, SendMessage)
+        assert checkout.text.startswith("К оплате: 10 $ — продление подписки «1 месяц».")
+        assert "Счёт откроется в @CryptoBot" in checkout.text
+        url = url_of(checkout, "Оплатить 10 $")
+        invoice = api.invoices[int(url.rsplit("IV", 1)[1])]
+        assert invoice["payload"] == f"paidclub:{sub_id}:2"
+
+        await feed(dp, bot, message_update(MEMBER, "/status"))
+        assert labels(last_screen(session)) == ["Оплатить продление 10 $"]
+    finally:
+        await client.aclose()
 
 
 async def test_a_refused_action_pops_up_the_reason_next_to_the_current_status(

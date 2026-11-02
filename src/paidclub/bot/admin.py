@@ -126,8 +126,8 @@ def format_stats(report: Report, *, plans: list[PlanConfig]) -> str:
     ]
     if totals.renewals_not_charged:
         lines.append(
-            f"Продления, которые нечем было списать (нет карты, способ оплаты выключен): "
-            f"{totals.renewals_not_charged}"
+            "Продления, которые нечем было списать (нет карты, оплата криптовалютой, способ "
+            f"оплаты выключен): {totals.renewals_not_charged}"
         )
     lines += [
         f"Продление не прошло: {totals.dunning_started}, "

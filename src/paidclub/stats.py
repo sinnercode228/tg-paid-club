@@ -51,9 +51,9 @@ means the owner's today.
     in ``dunning_started``.
 ``renewals_not_charged``
     Renewals that were due but went to no provider, so nothing could be charged: the member
-    paid without saving a card (they renew with the "pay" button), or the subscription's
-    provider was switched off. Counted per attempt, like ``failed_charges``, and kept out of
-    it, so that number stays about real declines.
+    paid without saving a card or pays in crypto (they renew with the "pay" button), or the
+    subscription's provider was switched off. Counted per attempt, like ``failed_charges``,
+    and kept out of it, so that number stays about real declines.
 ``failed_checkouts``
     Failed payments the member made on a checkout page (first payment or the "pay" button).
 ``revenue``
