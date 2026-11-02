@@ -22,6 +22,8 @@ def test_money_round_trips_decimal_strings() -> None:
     assert Money.from_decimal("990.00", "RUB") == Money(99000, "RUB")
     assert Money.from_decimal("2490", "RUB").to_decimal_str() == "2490.00"
     assert Money(500, "XTR").to_decimal_str() == "500"
+    assert Money.from_decimal("10", "USD") == Money(1000, "USD")
+    assert Money(999, "USD").to_decimal_str() == "9.99"
 
 
 def test_money_refuses_more_precision_than_the_currency_has() -> None:
@@ -29,11 +31,13 @@ def test_money_refuses_more_precision_than_the_currency_has() -> None:
         Money.from_decimal("9.999", "RUB")
     with pytest.raises(ValueError, match="decimal places"):
         Money.from_decimal("1.5", "XTR")
+    with pytest.raises(ValueError, match="decimal places"):
+        Money.from_decimal("9.995", "USD")
 
 
 def test_money_refuses_unknown_currencies_and_negative_amounts() -> None:
     with pytest.raises(ValueError, match="currency"):
-        Money(100, "USD")
+        Money(100, "EUR")
     with pytest.raises(ValueError, match="negative"):
         Money(-1, "RUB")
 
@@ -43,6 +47,8 @@ def test_money_human_form() -> None:
     assert Money(890000, "RUB").human() == "8 900 ₽"
     assert Money(149050, "RUB").human() == "1 490,50 ₽"
     assert Money(500, "XTR").human() == "500 ⭐"
+    assert Money(1000, "USD").human() == "10 $"
+    assert Money(999, "USD").human() == "9,99 $"
 
 
 # --- settings ----------------------------------------------------------------------------------
@@ -56,9 +62,12 @@ def test_defaults_describe_three_plans_and_the_fake_provider() -> None:
     assert month is not None
     assert month.price_for("RUB") == Money(99000, "RUB")
     assert month.price_for("XTR") == Money(500, "XTR")
+    assert month.price_for("USD") == Money(1000, "USD")
+    assert month.currencies == ["RUB", "XTR", "USD"]
     quarter = settings.plan("quarter")
     assert quarter is not None
     assert quarter.price_for("XTR") is None
+    assert quarter.currencies == ["RUB", "USD"]
 
 
 def test_list_settings_accept_comma_separated_env_values(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -115,7 +124,18 @@ def test_stars_price_only_on_thirty_day_plans() -> None:
 
 
 def test_plan_needs_a_price_with_at_most_two_decimals() -> None:
-    with pytest.raises(ValidationError, match="needs price_rub"):
+    with pytest.raises(ValidationError, match="needs price_rub, price_stars, price_usd"):
         PlanConfig(code="x", title="X")
     with pytest.raises(ValidationError, match="decimal places"):
         PlanConfig(code="x", title="X", price_rub=Decimal("9.999"))
+    with pytest.raises(ValidationError, match="decimal places"):
+        PlanConfig(code="x", title="X", price_usd=Decimal("9.999"))
+    with pytest.raises(ValidationError, match="greater than 0"):
+        PlanConfig(code="x", title="X", price_usd=Decimal("0"))
+
+
+def test_a_plan_can_be_priced_in_dollars_alone() -> None:
+    plan = PlanConfig(code="vip", title="VIP", price_usd=Decimal("49.90"))
+    assert plan.price_for("USD") == Money(4990, "USD")
+    assert plan.price_for("RUB") is None
+    assert plan.currencies == ["USD"]

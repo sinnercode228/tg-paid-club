@@ -5,6 +5,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -16,10 +17,11 @@ from aiogram.types import BufferedInputFile, Chat, Message, Update, User
 
 from paidclub.bot.admin import USAGE, create_admin_router, format_stats, parse_days
 from paidclub.clock import FakeClock
+from paidclub.config import PlanConfig
 from paidclub.container import Core
 from paidclub.stats import club_report
 from tests.helpers import OWNER_ID
-from tests.test_stats import build_dataset
+from tests.test_stats import add_dollar_member, build_dataset
 
 #: 23:00 on 31 March in Moscow: "/stats 31" covers exactly the hand-built March.
 END_OF_MARCH = datetime(2026, 3, 31, 20, 0, tzinfo=UTC)
@@ -137,6 +139,17 @@ async def test_stats_reports_the_month(march: Core, bot: Bot) -> None:
     assert any(line.startswith("Требуют внимания: 2 платежа без зачисления") for line in lines)
 
 
+async def test_stats_lists_three_currencies_side_by_side(march: Core, bot: Bot) -> None:
+    await add_dollar_member(march)
+    await feed(march, bot, command("/stats 31"))
+
+    [reply] = sent(bot)
+    assert isinstance(reply, SendMessage)
+    lines = reply.text.replace("\xa0", " ").splitlines()
+    assert "MRR: 5 532 ₽, 500 ⭐ и 10 $" in lines
+    assert "Выручка: 5 460 ₽, 500 ⭐ и 10 $ (6 платежей)" in lines
+
+
 async def test_stats_defaults_to_thirty_days(march: Core, bot: Bot) -> None:
     await feed(march, bot, command("/stats"))
 
@@ -190,11 +203,14 @@ async def test_export_sends_two_csv_files(march: Core, bot: Bot) -> None:
 
 
 async def test_empty_club(core: Core) -> None:
+    vip = PlanConfig(code="vip", title="VIP", price_usd=Decimal("49.90"))
+    core.settings = core.settings.model_copy(update={"plans": [*core.settings.plans, vip]})
     text = format_stats(await club_report(core), plans=core.settings.plans).replace("\xa0", " ")
 
     assert "Сейчас в клубе: 0" in text
     assert "MRR: 0 ₽" in text
     assert "Выручка: 0 ₽ (0 платежей)" in text
+    assert "VIP: в клубе 0, выручка 0 $, MRR 0 $" in text
     assert "Отток" not in text
     assert "Требуют внимания" not in text
 

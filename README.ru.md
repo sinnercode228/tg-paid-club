@@ -328,7 +328,7 @@ PAIDCLUB_DUNNING_RETRY_DAYS=0.25,0.5
 | `PAIDCLUB_ADMIN_USERNAME` | `admin` | Имя пользователя для basic auth на `/admin`. |
 | `PAIDCLUB_ADMIN_PASSWORD` | не задан | Пароль basic auth для `/admin`. Если не задан ни он, ни токен, `/admin` отвечает 404. |
 | `PAIDCLUB_CHECKOUT_RETURN_URL` | не задан | Куда провайдер возвращает участника после оплаты. По умолчанию это `{PAIDCLUB_PUBLIC_BASE_URL}/paid` — страница, которая отправляет обратно в бот и ничего не обещает насчёт платежа. |
-| `PAIDCLUB_PLANS` | `month` 990 ₽ или 500 ⭐, `quarter` 2490 ₽, `year` 8900 ₽ | Тарифы списком в JSON: `code`, `title`, `period_unit` (`month` или `day`), `period_count` (от 1 до 36), `price_rub` (строка вида `"990.00"`), `price_stars` (только у тарифов на месяц или 30 дней). |
+| `PAIDCLUB_PLANS` | `month` 990 ₽, 500 ⭐ или 10 $, `quarter` 2490 ₽ или 25 $, `year` 8900 ₽ или 90 $ | Тарифы списком в JSON: `code`, `title`, `period_unit` (`month` или `day`), `period_count` (от 1 до 36), `price_rub` (строка вида `"990.00"`), `price_stars` (только у тарифов на месяц или 30 дней), `price_usd` (строка вида `"10.00"`, для оплаты криптовалютой). |
 | `PAIDCLUB_PROVIDERS` | `fake` | `yookassa`, `stars` и/или `fake`, в том порядке, в каком их видят участники. |
 | `PAIDCLUB_GRACE_DAYS` | `3` | Сколько дней доступ сохраняется после неудачного продления, пока идут повторы. |
 | `PAIDCLUB_DUNNING_RETRY_DAYS` | `1,3` | Повторные списания, в днях после первой неудачи. По возрастанию, последнее — внутри льготного периода. |

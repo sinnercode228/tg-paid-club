@@ -17,7 +17,7 @@ means the owner's today.
     snapshotted on each subscription divided by its length in months (a 30-day period is one
     month, a year is 12, the same rule as :attr:`paidclub.config.PlanConfig.months_equivalent`),
     summed per currency. Canceled subscriptions are left out because they will not pay again.
-    Rubles and Telegram Stars are never added together.
+    Rubles, Telegram Stars and dollars are never added together.
 
 **Activity in a window** (from ``subscription_events`` and ``payments``, by ``created_at``)
 
@@ -267,7 +267,7 @@ class Holding:
 
 
 def whole_units(values: dict[str, Money]) -> dict[str, Money]:
-    """Amounts rounded to whole rubles and stars, for showing MRR, which is an estimate."""
+    """Amounts rounded to whole rubles, stars and dollars, for showing MRR, an estimate."""
     return {
         code: Money.from_decimal(money.to_decimal().quantize(Decimal(1), ROUND_HALF_EVEN), code)
         for code, money in values.items()

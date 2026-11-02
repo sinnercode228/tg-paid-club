@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from paidclub.domain.subscriptions import BillingPolicy, PeriodUnit
-from paidclub.money import Money
+from paidclub.money import CURRENCY_EXPONENTS, Money
 
 ProviderName = Literal["fake", "yookassa", "stars"]
 
@@ -61,13 +61,19 @@ class PlanConfig(BaseModel):
     price_rub: Decimal | None = Field(default=None, gt=0)
     #: Price in Telegram Stars per 30 days. Only for monthly (or 30-day) plans.
     price_stars: int | None = Field(default=None, gt=0)
+    #: Price in US dollars for crypto invoices, e.g. ``"10.00"``; the member pays it in a coin.
+    price_usd: Decimal | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _check_prices(self) -> Self:
-        if self.price_rub is None and self.price_stars is None:
-            raise ValueError(f"plan {self.code!r} needs price_rub, price_stars or both")
+        if self.price_rub is None and self.price_stars is None and self.price_usd is None:
+            raise ValueError(
+                f"plan {self.code!r} needs price_rub, price_stars, price_usd or several of them"
+            )
         if self.price_rub is not None:
             Money.from_decimal(self.price_rub, "RUB")  # rejects more than two decimal places
+        if self.price_usd is not None:
+            Money.from_decimal(self.price_usd, "USD")  # cents at most
         if self.price_stars is not None and not self.is_stars_compatible:
             raise ValueError(
                 f"plan {self.code!r}: Telegram Stars subscriptions renew every 30 days, "
@@ -84,7 +90,14 @@ class PlanConfig(BaseModel):
             return Money.from_decimal(self.price_rub, "RUB")
         if currency == "XTR" and self.price_stars is not None:
             return Money(self.price_stars, "XTR")
+        if currency == "USD" and self.price_usd is not None:
+            return Money.from_decimal(self.price_usd, "USD")
         return None
+
+    @property
+    def currencies(self) -> list[str]:
+        """The currencies the plan has a price in, rubles first, then Stars, then dollars."""
+        return [code for code in CURRENCY_EXPONENTS if self.price_for(code) is not None]
 
     @property
     def months_equivalent(self) -> Decimal:
@@ -96,10 +109,27 @@ class PlanConfig(BaseModel):
 
 DEFAULT_PLANS: tuple[PlanConfig, ...] = (
     PlanConfig(
-        code="month", title="1 месяц", period_count=1, price_rub=Decimal("990.00"), price_stars=500
+        code="month",
+        title="1 месяц",
+        period_count=1,
+        price_rub=Decimal("990.00"),
+        price_stars=500,
+        price_usd=Decimal("10.00"),
     ),
-    PlanConfig(code="quarter", title="3 месяца", period_count=3, price_rub=Decimal("2490.00")),
-    PlanConfig(code="year", title="12 месяцев", period_count=12, price_rub=Decimal("8900.00")),
+    PlanConfig(
+        code="quarter",
+        title="3 месяца",
+        period_count=3,
+        price_rub=Decimal("2490.00"),
+        price_usd=Decimal("25.00"),
+    ),
+    PlanConfig(
+        code="year",
+        title="12 месяцев",
+        period_count=12,
+        price_rub=Decimal("8900.00"),
+        price_usd=Decimal("90.00"),
+    ),
 )
 
 

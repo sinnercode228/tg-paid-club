@@ -169,7 +169,7 @@ def _month_label(month: date) -> str:
 
 def _plan_currency(plans: Sequence[PlanConfig], code: str) -> str:
     plan = next((plan for plan in plans if plan.code == code), None)
-    return "XTR" if plan is not None and plan.price_rub is None else "RUB"
+    return plan.currencies[0] if plan is not None else "RUB"
 
 
 # --- charts --------------------------------------------------------------------------------
@@ -193,8 +193,8 @@ def nice_ticks(maximum: Decimal, most: int = 5) -> list[Decimal]:
     """Round, evenly spaced ticks from 0 up to the first one at or above ``maximum``.
 
     The step is the smallest of 1, 2, 2.5 or 5 times a power of ten that needs at most
-    ``most`` intervals, and never below 1: every plotted value here (rubles, stars, members)
-    reads naturally in whole units.
+    ``most`` intervals, and never below 1: every plotted value here (rubles, stars, dollars,
+    members) reads naturally in whole units.
     """
     if maximum <= 0:
         return [Decimal(0), Decimal(1)]

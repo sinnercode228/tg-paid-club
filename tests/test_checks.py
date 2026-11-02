@@ -178,6 +178,7 @@ def test_describe_hides_secrets() -> None:
     assert "admin-secret" not in text
     assert "postgresql+asyncpg://club:***@db/club" in text
     assert "/admin bearer token" in text
+    assert "month (1 month, 990.00 RUB / 500 XTR / 10.00 USD)" in text
     assert safe_database_url("sqlite+aiosqlite:///./x.db") == "sqlite+aiosqlite:///./x.db"
 
 

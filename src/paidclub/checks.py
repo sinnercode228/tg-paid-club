@@ -237,6 +237,8 @@ def describe(settings: Settings) -> list[str]:
             prices.append(f"{plan.price_rub} RUB")
         if plan.price_stars is not None:
             prices.append(f"{plan.price_stars} XTR")
+        if plan.price_usd is not None:
+            prices.append(f"{plan.price_usd} USD")
         unit = "month" if plan.period_unit == "month" else "day"
         plans.append(
             f"{plan.code} ({plan.period_count} {unit}{'s' if plan.period_count > 1 else ''}, "

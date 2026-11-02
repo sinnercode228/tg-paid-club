@@ -15,6 +15,7 @@ from fastapi import FastAPI
 from pydantic import SecretStr
 
 from paidclub.clock import FakeClock
+from paidclub.config import PlanConfig
 from paidclub.container import Core
 from paidclub.web.admin import (
     CSS,
@@ -26,7 +27,7 @@ from paidclub.web.admin import (
     line_chart,
     nice_ticks,
 )
-from tests.test_stats import build_dataset
+from tests.test_stats import add_dollar_member, build_dataset
 
 TOKEN = "s3cret-token"
 PASSWORD = "пароль-владельца"
@@ -167,6 +168,27 @@ async def test_dashboard_shows_the_month(march: Core, client: httpx.AsyncClient)
     assert "Платёж ссылается на неизвестную подписку" in html
     assert 'href="?days=7"' in html
     assert "<script" not in html
+
+
+async def test_dollars_get_their_own_amounts_and_chart(
+    march: Core, client: httpx.AsyncClient
+) -> None:
+    await add_dollar_member(march)
+    html = (await client.get("/admin?days=31", headers=BEARER)).text
+    html = html.replace("\xa0", " ").replace("&nbsp;", " ")
+
+    assert '<p class="value">5 532 ₽ · 500 ⭐ · 10 $</p>' in html  # MRR
+    assert '<p class="value">5 460 ₽ · 500 ⭐ · 10 $</p>' in html  # revenue
+    assert "Выручка по дням, $" in html
+    assert html.count("<svg") == 4
+
+
+async def test_a_plan_priced_in_dollars_alone_shows_zero_dollars(secured: Core) -> None:
+    vip = PlanConfig(code="vip", title="VIP", price_usd=Decimal("49.90"))
+    secured.settings = secured.settings.model_copy(update={"plans": [vip]})
+    async with await client_for(secured) as client:
+        html = (await client.get("/admin", headers=BEARER)).text.replace("\xa0", " ")
+    assert "<td>VIP</td><td>0</td><td>0</td><td>0 $</td>" in html
 
 
 async def test_page_is_locked_down(march: Core, client: httpx.AsyncClient) -> None:

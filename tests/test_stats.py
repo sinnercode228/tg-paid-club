@@ -65,6 +65,7 @@ MONTH = Plan("month", 99_000)
 QUARTER = Plan("quarter", 249_000, count=3)
 YEAR = Plan("year", 890_000, count=12)
 MONTH_STARS = Plan("month", 500, currency="XTR", provider="stars")
+MONTH_USD = Plan("month", 1000, currency="USD", provider="cryptopay")
 #: A plan the owner no longer sells (not in settings), billed every 15 days.
 LEGACY = Plan("legacy15", 49_500, unit="day", count=15)
 
@@ -243,6 +244,15 @@ async def build_dataset(core: Core) -> None:
         await session.flush()
 
 
+async def add_dollar_member(core: Core) -> None:
+    """K joins on 16 March and pays 10 $ through a crypto invoice."""
+    async with core.sessions() as session, session.begin():
+        d = Dataset(session)
+        d.next_tg, d.payments = 6000, 100  # clear of the ids build_dataset used
+        await d.active("K", MONTH_USD, at=utc(3, 16))
+        d.pay("K", at=utc(3, 16), for_period=1, purpose=PaymentPurpose.CHECKOUT)
+
+
 async def march_report(core: Core) -> Report:
     async with core.sessions() as session:
         return await build_report(
@@ -286,6 +296,33 @@ async def test_revenue_keeps_currencies_apart_and_ignores_unapplied_money(core: 
         "XTR": Money(500, "XTR"),
     }
     assert report.currencies == ["RUB", "XTR"]
+
+
+async def test_dollars_are_a_third_currency_never_added_to_the_others(core: Core) -> None:
+    await build_dataset(core)
+    await add_dollar_member(core)
+    report = await march_report(core)
+
+    assert report.totals.revenue == {
+        "RUB": Money.from_decimal("5460.00", "RUB"),
+        "XTR": Money(500, "XTR"),
+        "USD": Money(1000, "USD"),
+    }
+    assert report.currencies == ["RUB", "XTR", "USD"]
+    assert report.snapshot.total.mrr == {
+        "RUB": Money(553_167, "RUB"),
+        "XTR": Money(500, "XTR"),
+        "USD": Money(1000, "USD"),
+    }
+    plans = {plan.code: plan for plan in report.plans}
+    assert plans["month"].period.revenue["USD"] == Money(1000, "USD")
+    data = report_to_dict(report)
+    assert data["totals"]["revenue"] == {"RUB": "5460.00", "XTR": "500", "USD": "10.00"}
+    assert data["now"]["mrr"] == {"RUB": "5531.67", "XTR": "500", "USD": "10.00"}
+    async with core.sessions() as session:
+        rows = _read_csv(await export_payments(session, MSK))
+    [dollars] = [row for row in rows if row["currency"] == "USD"]
+    assert (dollars["provider"], dollars["amount"]) == ("cryptopay", "10.00")
 
 
 async def test_live_members_and_churn_rate(core: Core) -> None:
