@@ -15,11 +15,13 @@ from aiogram.methods import (
     AnswerPreCheckoutQuery,
     CreateInvoiceLink,
     EditUserStarSubscription,
+    RefundStarPayment,
     SendMessage,
     TelegramMethod,
 )
 from aiogram.methods.base import TelegramType
 from aiogram.types import LabeledPrice, SuccessfulPayment, Update, User
+from aiogram_stars import PaymentStatus, StarsPayments
 from pydantic import SecretStr
 from sqlalchemy import event, select
 from sqlalchemy.exc import OperationalError
@@ -41,12 +43,13 @@ from paidclub.billing.stars import (
     ERROR_INVALID,
     ERROR_STALE,
     ERROR_UNAVAILABLE,
-    InvoicePayload,
+    InvoiceOrder,
     PaymentNotStored,
     StarsProvider,
     check_pre_checkout,
     create_stars_router,
     payment_event,
+    stars_payments,
 )
 from paidclub.bot import member, screens
 from paidclub.bot.catalog import catalog
@@ -65,6 +68,7 @@ MEMBER = 901
 STRANGER = 902
 INVOICE_LINK = "https://t.me/$demo-invoice"
 THIRTY_DAYS = timedelta(days=30)
+PAYLOAD_SECRET = "test-payload-secret-0123456789"
 
 
 class RecordingSession(BaseSession):
@@ -143,21 +147,26 @@ async def bot(session: RecordingSession) -> AsyncIterator[Bot]:
     await instance.session.close()
 
 
-@pytest.fixture
-def stars(core: Core, bot: Bot) -> StarsProvider:
-    provider = StarsProvider(bot)
-    core.providers.register(provider)
-    return provider
-
-
 async def no_sleep(seconds: float) -> None:
     return None
 
 
 @pytest.fixture
-def dispatcher(core: Core, stars: StarsProvider) -> Dispatcher:
+def payments_lib(core: Core) -> StarsPayments:
+    return stars_payments(core, secret=PAYLOAD_SECRET, sleep=no_sleep)
+
+
+@pytest.fixture
+def stars(core: Core, bot: Bot, payments_lib: StarsPayments) -> StarsProvider:
+    provider = StarsProvider(bot, payments_lib)
+    core.providers.register(provider)
+    return provider
+
+
+@pytest.fixture
+def dispatcher(core: Core, stars: StarsProvider, payments_lib: StarsPayments) -> Dispatcher:
     dp = Dispatcher()
-    dp.include_router(create_stars_router(core, sleep=no_sleep))
+    dp.include_router(create_stars_router(core, payments_lib, sleep=no_sleep))
     return dp
 
 
@@ -248,8 +257,10 @@ async def test_the_invoice_is_a_monthly_stars_subscription(
     assert call.currency == "XTR"
     assert call.subscription_period == 2592000
     assert call.prices == [LabeledPrice(label="1 месяц", amount=500)]
-    assert call.provider_token is None
-    assert payload == f"paidclub:{sub_id}:1"
+    assert call.provider_token == ""
+    # aiogram-stars signs the order id together with the price.
+    assert payload == stars.payments.make_payload(f"{sub_id}:1", 500)
+    assert payload != stars.payments.make_payload(f"{sub_id}:1", 499)
     assert 1 <= len(call.title) <= 32
     assert 1 <= len(call.description) <= 255
     assert len(payload.encode()) <= 128
@@ -293,11 +304,15 @@ async def test_stars_has_no_webhooks_and_no_merchant_charges(stars: StarsProvide
 # --- turning payments into events --------------------------------------------------------------
 
 
+#: How aiogram-stars signs an invoice for subscription 7, period 1, 500 Stars.
+SIGNED_7_1 = "7:1.miAm8kRMRiZKd3bGGIM-Sw"
+
+
 def successful_payment(**changes: Any) -> SuccessfulPayment:
     values: dict[str, Any] = {
         "currency": "XTR",
         "total_amount": 500,
-        "invoice_payload": "paidclub:7:1",
+        "invoice_payload": SIGNED_7_1,
         "telegram_payment_charge_id": "ch_1",
         "provider_payment_charge_id": "",
         "subscription_expiration_date": int((START + THIRTY_DAYS).timestamp()),
@@ -338,17 +353,32 @@ def test_a_recurring_payment_is_a_renewal_with_the_period_end_from_telegram() ->
     assert (event.for_period, event.payment_method_id, event.period_end) == (None, None, end)
 
 
+def test_the_signed_payload_is_the_one_aiogram_stars_makes(payments_lib: StarsPayments) -> None:
+    assert payments_lib.make_payload("7:1", 500) == SIGNED_7_1
+
+
+def test_an_invoice_made_before_the_payloads_were_signed_is_still_ours() -> None:
+    legacy = payment_event(successful_payment(invoice_payload="paidclub:7:1"), occurred_at=START)
+    assert legacy == payment_event(successful_payment(), occurred_at=START)
+
+
 @pytest.mark.parametrize(
     "changes",
-    [{"invoice_payload": "shop:order:5"}, {"invoice_payload": "paidclub:x:1"}, {"currency": "RUB"}],
+    [
+        {"invoice_payload": "shop:order:5"},
+        {"invoice_payload": "paidclub:x:1"},
+        {"invoice_payload": "x:1.miAm8kRMRiZKd3bGGIM-Sw"},
+        {"invoice_payload": "7:1"},
+        {"currency": "RUB"},
+    ],
 )
 def test_payments_for_other_invoices_are_not_ours(changes: dict[str, Any]) -> None:
     assert payment_event(successful_payment(**changes), occurred_at=START) is None
 
 
-def test_payload_round_trip() -> None:
-    assert InvoicePayload.decode(InvoicePayload(12, 3).encode()) == InvoicePayload(12, 3)
-    assert InvoicePayload.decode("paidclub:12") is None
+def test_order_id_round_trip() -> None:
+    assert InvoiceOrder.parse(InvoiceOrder(12, 3).order_id) == InvoiceOrder(12, 3)
+    assert InvoiceOrder.parse("12") is None
 
 
 # --- pre-checkout ------------------------------------------------------------------------------
@@ -385,16 +415,18 @@ async def test_pre_checkout_rejects_wrong_amounts_and_unknown_invoices(
 ) -> None:
     sub_id, payload = await stars_invoice(core, session)
 
-    async def check(payload: str, *, amount: int = 500, currency: str = "XTR") -> str | None:
+    async def check(order_id: str, *, amount: int = 500, currency: str = "XTR") -> str | None:
         return await check_pre_checkout(
-            core, user_id=MEMBER, currency=currency, total_amount=amount, payload=payload
+            core, user_id=MEMBER, currency=currency, total_amount=amount, order_id=order_id
         )
 
-    assert await check(payload) is None
-    assert await check(payload, amount=499) == ERROR_AMOUNT
-    assert await check(payload, currency="RUB") == ERROR_AMOUNT
-    assert await check(f"paidclub:{sub_id + 100}:1") == ERROR_INVALID
-    assert await check("paidclub:nonsense") == ERROR_INVALID
+    order_id = f"{sub_id}:1"
+    assert payload.startswith(f"{order_id}.")
+    assert await check(order_id) is None
+    assert await check(order_id, amount=499) == ERROR_AMOUNT
+    assert await check(order_id, currency="RUB") == ERROR_AMOUNT
+    assert await check(f"{sub_id + 100}:1") == ERROR_INVALID
+    assert await check("nonsense") == ERROR_INVALID
 
 
 async def test_an_invoice_opened_again_after_paying_is_declined(
@@ -411,11 +443,11 @@ async def test_an_invoice_opened_again_after_paying_is_declined(
 async def test_an_old_stars_invoice_is_declined_while_another_subscription_is_live(
     core: Core, session: RecordingSession, stars: StarsProvider, fake: FakeProvider
 ) -> None:
-    _, payload = await stars_invoice(core, session)
+    sub_id, _ = await stars_invoice(core, session)
     await subscribe(core, fake, MEMBER)
 
     error = await check_pre_checkout(
-        core, user_id=MEMBER, currency="XTR", total_amount=500, payload=payload
+        core, user_id=MEMBER, currency="XTR", total_amount=500, order_id=f"{sub_id}:1"
     )
     assert error == ERROR_HAS_SUBSCRIPTION
 
@@ -435,8 +467,9 @@ async def test_after_expiry_the_old_invoice_is_stale_and_a_new_one_reactivates(
     assert (await Scheduler(core, FakeRevoker()).tick()).expired == 1
 
     async def check(payload: str) -> str | None:
+        order_id = payload.rpartition(".")[0]
         return await check_pre_checkout(
-            core, user_id=MEMBER, currency="XTR", total_amount=500, payload=payload
+            core, user_id=MEMBER, currency="XTR", total_amount=500, order_id=order_id
         )
 
     assert await check(old_payload) == ERROR_STALE
@@ -471,8 +504,9 @@ async def test_pre_checkout_is_declined_in_time_when_the_check_hangs(
         return None
 
     monkeypatch.setattr(stars_module, "check_pre_checkout", stuck)
+    impatient = stars_payments(core, secret=PAYLOAD_SECRET, pre_checkout_timeout=0.05)
     dp = Dispatcher()
-    dp.include_router(create_stars_router(core, pre_checkout_timeout=0.05))
+    dp.include_router(create_stars_router(core, impatient))
 
     await asyncio.wait_for(dp.feed_update(bot, pre_checkout_update(payload)), timeout=2)
 
@@ -480,11 +514,30 @@ async def test_pre_checkout_is_declined_in_time_when_the_check_hangs(
     assert (answer.ok, answer.error_message) == (False, ERROR_UNAVAILABLE)
 
 
-async def test_invoices_that_are_not_ours_are_left_to_other_handlers(
-    session: RecordingSession, dispatcher: Dispatcher, bot: Bot
+async def test_an_invoice_this_bot_did_not_sign_is_declined(
+    core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot
 ) -> None:
+    sub_id, _ = await stars_invoice(core, session)
+    forged = f"{sub_id}:1.AAAAAAAAAAAAAAAAAAAAAA"
+
     await dispatcher.feed_update(bot, pre_checkout_update("shop:order:5"))
-    assert session.of(AnswerPreCheckoutQuery) == []
+    await dispatcher.feed_update(bot, pre_checkout_update(forged))
+
+    assert [(a.ok, a.error_message) for a in session.of(AnswerPreCheckoutQuery)] == [
+        (False, ERROR_UNAVAILABLE),
+        (False, ERROR_UNAVAILABLE),
+    ]
+
+
+async def test_an_invoice_made_before_signing_is_declined_as_stale(
+    core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot
+) -> None:
+    sub_id, _ = await stars_invoice(core, session)
+
+    await dispatcher.feed_update(bot, pre_checkout_update(f"paidclub:{sub_id}:1"))
+
+    [answer] = session.of(AnswerPreCheckoutQuery)
+    assert (answer.ok, answer.error_message) == (False, ERROR_STALE)
 
 
 # --- payments ----------------------------------------------------------------------------------
@@ -587,7 +640,7 @@ async def test_paying_again_after_a_missed_renewal_stops_the_old_telegram_subscr
     link = await club.start_repayment(core, telegram_id=MEMBER, subscription_id=sub_id)
     assert link.url == INVOICE_LINK
     payload = session.of(CreateInvoiceLink)[-1].payload
-    assert payload == f"paidclub:{sub_id}:2"
+    assert payload.startswith(f"{sub_id}:2.")
     await dispatcher.feed_update(bot, pre_checkout_update(payload))
     assert session.of(AnswerPreCheckoutQuery)[-1].ok is True
     new_end = clock.now() + THIRTY_DAYS
@@ -604,6 +657,76 @@ async def test_paying_again_after_a_missed_renewal_stops_the_old_telegram_subscr
     assert sub.payment_method_id == "ch_new"
     [stop] = session.of(EditUserStarSubscription)
     assert (stop.telegram_payment_charge_id, stop.is_canceled) == ("ch_1", True)
+
+
+async def test_renewals_of_a_subscription_bought_before_signing_still_apply(
+    core: Core,
+    session: RecordingSession,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    clock: FakeClock,
+    payments_lib: StarsPayments,
+) -> None:
+    """Telegram renews with the payload of the first invoice, which an older version of the
+    club made unsigned; refunding those renewals would end the subscription."""
+    sub_id, _ = await stars_invoice(core, session)
+    legacy = f"paidclub:{sub_id}:1"
+    expires = clock.now() + THIRTY_DAYS
+    await dispatcher.feed_update(
+        bot, payment_update(legacy, charge_id="ch_1", expires=expires, first=True)
+    )
+    clock.set(expires)
+    await dispatcher.feed_update(
+        bot, payment_update(legacy, charge_id="ch_2", expires=expires + THIRTY_DAYS, first=False)
+    )
+
+    sub = await load_sub(core, sub_id)
+    assert (sub.status, sub.periods_paid, sub.payment_method_id) == (SubStatus.ACTIVE, 2, "ch_1")
+    assert [p.outcome for p in await payments(core)] == [PaymentOutcome.APPLIED] * 2
+    assert await payments_lib.get_refund("ch_1") is None
+    assert await payments_lib.get_refund("ch_2") is None
+
+
+async def test_a_paid_invoice_this_bot_did_not_sign_is_refunded_and_not_applied(
+    core: Core,
+    session: RecordingSession,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    clock: FakeClock,
+    payments_lib: StarsPayments,
+) -> None:
+    sub_id, _ = await stars_invoice(core, session)
+    forged = f"{sub_id}:1.AAAAAAAAAAAAAAAAAAAAAA"
+
+    await dispatcher.feed_update(
+        bot, payment_update(forged, charge_id="ch_forged", expires=START + THIRTY_DAYS, first=True)
+    )
+
+    assert (await load_sub(core, sub_id)).status is SubStatus.PENDING
+    assert await payments(core) == []
+    recorded = await payments_lib.get_payment("ch_forged")
+    assert recorded is not None and recorded.status is PaymentStatus.REJECTED
+    await payments_lib.send_due_refunds(bot)
+    [refund] = session.of(RefundStarPayment)
+    assert (refund.user_id, refund.telegram_payment_charge_id) == (MEMBER, "ch_forged")
+
+
+async def test_a_signed_invoice_for_something_other_than_a_club_period_is_refunded(
+    core: Core,
+    session: RecordingSession,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    payments_lib: StarsPayments,
+) -> None:
+    payload = payments_lib.make_payload("gift-card-5", 500)
+
+    await dispatcher.feed_update(
+        bot, payment_update(payload, charge_id="ch_gift", expires=START + THIRTY_DAYS, first=True)
+    )
+
+    assert await payments(core) == []
+    refund = await payments_lib.get_refund("ch_gift")
+    assert refund is not None and refund.reason == ERROR_INVALID
 
 
 # --- cancel and resume -------------------------------------------------------------------------
@@ -903,3 +1026,46 @@ async def test_a_stored_payment_that_never_applies_is_given_up_with_an_owner_ale
     assert (row.status, row.attempts) == (StarsPaymentStatus.FAILED, stars_module.APPLY_ATTEMPTS)
     [alert] = await notifications(core, "owner_alert")
     assert "ch_1" in alert.text
+
+
+async def test_a_payment_that_cannot_even_be_recorded_reaches_the_owner_outside_the_database(
+    core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot, clock: FakeClock
+) -> None:
+    """aiogram-stars records the charge before the club sees it; when that fails, the club's
+    own store is never reached, and the owner still has to hear about the payment."""
+    _, payload = await stars_invoice(core, session)
+    update_ = payment_update(
+        payload, charge_id="ch_1", expires=clock.now() + THIRTY_DAYS, first=True
+    )
+    with failing_inserts(core, "stars_payments", times=1), pytest.raises(OperationalError):
+        await dispatcher.feed_update(bot, update_)
+
+    [alert] = [call for call in session.of(SendMessage) if call.chat_id == core.settings.owner_id]
+    assert "ch_1" in alert.text and "500" in alert.text
+    assert await stored_updates(core) == []
+
+
+async def test_a_payment_stored_before_a_later_error_does_not_alarm_the_owner(
+    core: Core,
+    session: RecordingSession,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, payload = await stars_invoice(core, session)
+
+    async def broken_notice(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("after the payment was stored")
+
+    monkeypatch.setattr(stars_module, "_tell_member_if_not_applied", broken_notice)
+    with pytest.raises(RuntimeError):
+        await dispatcher.feed_update(
+            bot,
+            payment_update(payload, charge_id="ch_1", expires=START + THIRTY_DAYS, first=True),
+        )
+
+    owner_id = core.settings.owner_id
+    assert [call for call in session.of(SendMessage) if call.chat_id == owner_id] == []
+    [row] = await stored_updates(core)
+    assert row.status is StarsPaymentStatus.APPLIED

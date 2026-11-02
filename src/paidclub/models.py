@@ -16,6 +16,9 @@ The constraints carry the guarantees, code only relies on them:
 
 Every status change of a subscription is also appended to ``subscription_events`` by a
 ``before_flush`` hook, whichever code path made it.
+
+``stars_payments`` and ``stars_refunds`` belong to aiogram-stars; they are added to
+``Base.metadata`` so that the schema is created and dropped as one.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, ClassVar
 
+from aiogram_stars.sqlalchemy import metadata as stars_metadata
 from sqlalchemy import (
     JSON,
     BigInteger,
@@ -83,6 +87,11 @@ class Base(DeclarativeBase):
         ExpireReason: _enum(ExpireReason),
         PaymentPurpose: _enum(PaymentPurpose),
     }
+
+
+# Copies for creating and dropping the schema; aiogram-stars queries its own Table objects.
+for _table in stars_metadata.tables.values():
+    _table.to_metadata(Base.metadata)
 
 
 class ClaimMixin:

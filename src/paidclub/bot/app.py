@@ -4,9 +4,10 @@ The run command wires it like this::
 
     core = await build_core(settings)
     bot = create_bot(settings)
+    stars = stars_payments(core, secret=...)   # aiogram-stars, see billing/stars.py
     dp = create_dispatcher(
         core,
-        extra_routers=[create_admin_router(core), create_stars_router(core)],
+        extra_routers=[create_admin_router(core), create_stars_router(core, stars)],
         owner_commands=ADMIN_COMMANDS,
     )
     scheduler = Scheduler(core, TelegramAccessRevoker(bot))

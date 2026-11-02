@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import ValidationError
+from pydantic import SecretStr, ValidationError
 
 from paidclub.checks import (
     Command,
@@ -296,7 +296,10 @@ def test_prod_refuses_a_guessable_dashboard_secret(field: str) -> None:
 
 
 def test_a_short_dashboard_secret_is_only_a_warning_outside_prod() -> None:
-    public = make(**{**PUBLIC_CLUB, "admin_password": "1234", "providers": ["stars"]})
+    public = make(
+        **{**PUBLIC_CLUB, "admin_password": "1234", "providers": ["stars"]},
+        stars_payload_secret="s" * 32,
+    )
     assert errors(public) == []
     assert any(
         p.severity == "warning" and "PAIDCLUB_ADMIN_PASSWORD is shorter" in p.message
@@ -304,6 +307,24 @@ def test_a_short_dashboard_secret_is_only_a_warning_outside_prod() -> None:
     )
     local = make(admin_token="demo")
     assert not [p for p in startup_problems(local, "web") if "shorter" in p.message]
+
+
+# --- the Stars payload secret ------------------------------------------------------------------
+
+
+def test_selling_stars_needs_a_payload_secret() -> None:
+    """Invoices are signed with it, and so are the renewals Telegram charges every month: a
+    secret made up at start would refund every renewal after a restart."""
+    selling = make(**{**PUBLIC_CLUB, "providers": ["stars"]})
+    [error] = errors(selling)
+    assert error.startswith("PAIDCLUB_STARS_PAYLOAD_SECRET is not set")
+    assert errors(selling, "web") == []
+    assert errors(selling.model_copy(update={"stars_payload_secret": SecretStr("s" * 32)})) == []
+
+
+def test_a_short_stars_payload_secret_is_refused() -> None:
+    with pytest.raises(ValidationError, match="at least 16"):
+        make(stars_payload_secret="short")
 
 
 # --- the YooKassa notification URL -------------------------------------------------------------

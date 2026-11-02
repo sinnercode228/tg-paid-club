@@ -129,6 +129,7 @@ no migrations.
 | `charge_attempts` | One row per renewal charge, written before the provider call: `started`, `pending`, `succeeded`, `failed`, number of calls, last error, next lookup | `idempotence_key` unique; `(subscription_id, for_period, attempt)` unique |
 | `checkouts` | Payments a provider created for a checkout link, looked up until decided | `(provider, provider_payment_id)` unique |
 | `stars_payment_updates` | Each Telegram Stars `successful_payment` as it arrived, stored before it is applied | `telegram_payment_charge_id` unique |
+| `stars_payments`, `stars_refunds` | aiogram-stars' records: each Stars charge with how it was handled, and the refunds it sends | `charge_id` primary key in both |
 | `notifications` | The outbox: rendered text, buttons, status, attempts, `not_after`, lease columns | `key` unique |
 | `access_events` | Every join decision and removal attempt: approved, declined, failed, removed, removed on join, not a participant, skipped admin, skipped (has access), no rights, error | — |
 
@@ -228,8 +229,8 @@ The loop sleeps one second when there is nothing to send.
 | A paid period | `(subscription_id, for_period)` | partial unique index on applied successful `payments` | a second payment for a paid period is recorded as `needs_refund`, and the owner is alerted |
 | A renewal charge | `paidclub-<subscription>-<period>-<attempt>`, attempt 0 for the regular renewal, 1 and 2 for retries | unique `charge_attempts.idempotence_key`; sent as YooKassa's `Idempotence-Key` header | YooKassa returns the first answer for 24 hours; after 23 hours the app searches `GET /v3/payments` for its metadata instead of sending again |
 | A checkout payment | a random UUID per checkout as `Idempotence-Key`; then `(provider, provider_payment_id)` | unique constraint on `checkouts` | the same key is reused once after a 5xx or a timeout; tapping "pay" twice makes two payment pages, and the second payment for the period is caught by the paid-period key |
-| A Stars update | `telegram_payment_charge_id` | unique `stars_payment_updates.telegram_payment_charge_id` | stored once, applied once |
-| A Stars first payment | the period in the invoice payload `paidclub:<subscription>:<period>` | paid-period key | a second Telegram subscription bought from the same invoice is `needs_refund`, and it is cancelled with `editUserStarSubscription` |
+| A Stars update | `telegram_payment_charge_id` | primary key of aiogram-stars' `stars_payments`, then unique `stars_payment_updates.telegram_payment_charge_id` | handed to the club once, stored once, applied once |
+| A Stars first payment | the period in the signed invoice payload `<subscription>:<period>.<signature>` (`paidclub:<subscription>:<period>` before signing) | paid-period key | a second Telegram subscription bought from the same invoice is `needs_refund`, and it is cancelled with `editUserStarSubscription` |
 | A refund | `(provider, refund_id)` | unique constraint on `refunds` | answered as `duplicate` |
 | A fake renewal | `fake_r_` + the first 20 hex digits of SHA-256 of the charge key | the fake provider derives the payment id from the key | the same payment id and the same answer |
 | A live subscription | `member_id` | partial unique index where the status is live | a member cannot hold two live subscriptions |
@@ -287,7 +288,7 @@ Tests that run these races: `tests/test_db.py::test_two_concurrent_claims_never_
 | between `banChatMember` and `unbanChatMember` | the ban ends by itself after 10 minutes; the retry finds a short ban it recognises as its own and lifts it at once. A ban without such an end was set by an admin and is left alone |
 | after Telegram accepted a message, before it was marked sent | the message is sent again once its lease runs out: the one place that is at least once rather than once |
 | while a Stars `successful_payment` is being applied | the update is already in `stars_payment_updates`; the scheduler applies it |
-| with the database down when a Stars payment arrives | storing is tried 4 times; then the owner gets a direct Telegram message with the charge id, outside the outbox, and the payment is logged at CRITICAL |
+| with the database down when a Stars payment arrives | storing is tried 4 times; then the owner gets a direct Telegram message with the charge id, outside the outbox, and the payment is logged at CRITICAL. The same happens when aiogram-stars cannot record the charge, before the club sees it |
 | before a YooKassa checkout notification was handled | YooKassa sends it again for 24 hours, and the scheduler looks the payment up anyway |
 
 ## Stats

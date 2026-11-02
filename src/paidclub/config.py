@@ -35,6 +35,8 @@ RETURN_PAGE_PATH = "/paid"
 TELEGRAM_SECRET_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,256}")
 #: A secret path segment of a webhook URL: URL-safe and long enough not to be guessed.
 PATH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
+#: aiogram-stars refuses a shorter payload secret.
+MIN_STARS_SECRET_BYTES = 16
 #: ``<bot id>:<secret>`` as @BotFather issues it.
 BOT_TOKEN_PATTERN = re.compile(r"[0-9]+:[A-Za-z0-9_-]+")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -190,6 +192,9 @@ class Settings(BaseSettings):
     #: Stars renewals are charged by Telegram; wait this long for the payment update before
     #: treating the renewal as failed.
     stars_renewal_wait_minutes: float = Field(default=60, ge=0)
+    #: Signs Stars invoice payloads. Renewals carry the payload of the first invoice, so it
+    #: must stay the same while any Stars subscription is active.
+    stars_payload_secret: SecretStr | None = None
 
     # --- fake provider ---------------------------------------------------------------------
     #: Signs fake checkout tokens and webhooks. Set it explicitly when running several web
@@ -300,6 +305,15 @@ class Settings(BaseSettings):
             return None
         if not TELEGRAM_SECRET_PATTERN.fullmatch(value.get_secret_value()):
             raise ValueError("Telegram accepts 1-256 characters: letters A-Z, a-z, digits, _ and -")
+        return value
+
+    @field_validator("stars_payload_secret")
+    @classmethod
+    def _check_stars_secret(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None or not value.get_secret_value():
+            return None
+        if len(value.get_secret_value().encode()) < MIN_STARS_SECRET_BYTES:
+            raise ValueError(f"must be at least {MIN_STARS_SECRET_BYTES} bytes long")
         return value
 
     @field_validator("yookassa_webhook_token")

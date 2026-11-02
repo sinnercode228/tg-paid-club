@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import secrets
 import signal
 from collections.abc import Awaitable, Callable, Coroutine, Generator
 from dataclasses import dataclass, field
@@ -36,7 +37,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from fastapi import FastAPI
 
-from paidclub.billing.stars import StarsProvider, create_stars_router
+from paidclub.billing.stars import StarsProvider, create_stars_router, stars_payments
 from paidclub.billing.yookassa import YooKassaProvider
 from paidclub.bot.admin import ADMIN_COMMANDS, create_admin_router
 from paidclub.bot.app import create_bot, create_dispatcher
@@ -111,13 +112,14 @@ async def build_app(
             return ClubApp(core=core, web=create_app(core), closers=closers)
 
         bot = create_bot(settings, session=bot_session)
+        stars = stars_payments(core, secret=_stars_secret(settings))
         # Registered even with Stars switched off in PAIDCLUB_PROVIDERS, which only decides
         # what is sold: members who subscribed earlier are still renewed by Telegram, their
         # payments must apply, and cancelling must still reach Telegram.
-        core.providers.register(StarsProvider(bot), sold="stars" in settings.providers)
+        core.providers.register(StarsProvider(bot, stars), sold="stars" in settings.providers)
         dispatcher = create_dispatcher(
             core,
-            extra_routers=[create_admin_router(core), create_stars_router(core)],
+            extra_routers=[create_admin_router(core), create_stars_router(core, stars)],
             owner_commands=ADMIN_COMMANDS,
         )
         telegram = None
@@ -150,6 +152,20 @@ async def build_app(
             await bot.session.close()
         await core.aclose()
         raise
+
+
+def _stars_secret(settings: Settings) -> str:
+    """``PAIDCLUB_STARS_PAYLOAD_SECRET``, or one made up for this process.
+
+    ``paidclub check`` refuses to run without it while Stars is sold. Without it nothing new
+    is signed, and only a Stars subscription signed with a secret that was removed since would
+    have its renewals refunded.
+    """
+    if settings.stars_payload_secret is not None:
+        return settings.stars_payload_secret.get_secret_value()
+    if "stars" in settings.providers:
+        log.warning("PAIDCLUB_STARS_PAYLOAD_SECRET is not set: Stars invoices break on restart")
+    return secrets.token_urlsafe(32)
 
 
 def _username_of(bot: Bot) -> Callable[[], Awaitable[str | None]]:

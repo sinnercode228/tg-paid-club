@@ -139,6 +139,13 @@ def startup_problems(settings: Settings, command: Command = "run") -> list[Probl
                 f"delivers webhooks only to ports {', '.join(map(str, TELEGRAM_WEBHOOK_PORTS))}"
             )
 
+    if command == "run" and "stars" in settings.providers and settings.stars_payload_secret is None:
+        error(
+            "PAIDCLUB_STARS_PAYLOAD_SECRET is not set: Stars invoices are signed with it, and "
+            "Telegram renews a subscription with the payload of its first invoice, so a secret "
+            "made up at every start would refund every renewal after a restart. Set a random "
+            "one, e.g. from python3 -c 'import secrets; print(secrets.token_urlsafe(32))'"
+        )
     if "yookassa" in settings.providers and (
         not settings.public_base_url.startswith("https://")
         or _port(settings.public_base_url) not in YOOKASSA_WEBHOOK_PORTS

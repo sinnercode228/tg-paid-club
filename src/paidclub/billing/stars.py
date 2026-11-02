@@ -20,13 +20,22 @@ What the Bot API offers (checked against aiogram's ``CreateInvoiceLink``,
 * Before a member pays, Telegram sends a ``pre_checkout_query`` that must be answered within
   10 seconds. Answering it does not move money; only ``successful_payment`` does.
 
-Refunds (``refundStarPayment``) are out of scope: when a payment cannot be applied, core alerts
-the owner, who can refund it.
+The Telegram side is aiogram-stars (:func:`stars_payments`). It signs the invoice payload,
+``<subscription>:<period>.<signature>``, for that order and the price; answers
+``pre_checkout_query`` in time with what :func:`check_pre_checkout` decides; records each
+``successful_payment`` once per ``telegram_payment_charge_id`` (``stars_payments``) before the
+club sees it; and refunds a paid invoice whose payload does not verify, from its own outbox
+(``stars_refunds``). A payment that verifies but cannot be applied (a period paid twice) is not
+refunded automatically: core alerts the owner, who decides.
 
-The provider never touches the database. :func:`create_stars_router` holds the handlers that
-turn Telegram updates into payments: each ``successful_payment`` is stored as it arrived
-(``stars_payment_updates``) before it is applied, because Telegram does not deliver it again,
-and the scheduler applies stored ones that failed (:func:`retry_stored_payments`).
+What a payment means for the club is decided here, and the provider never touches the
+database. Each payment is stored as it arrived (``stars_payment_updates``) before it is
+applied, because Telegram does not deliver it again, and the scheduler applies stored ones
+that failed (:func:`retry_stored_payments`).
+
+Invoices made before the payloads were signed carry ``paidclub:<subscription>:<period>``, and
+Telegram renews their subscriptions with that payload. :func:`create_stars_router` applies
+those payments and declines such an invoice at pre-checkout, so the member opens a new one.
 """
 
 from __future__ import annotations
@@ -38,8 +47,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
 from aiogram import Bot, F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from aiogram.types import LabeledPrice, Message, PreCheckoutQuery, SuccessfulPayment
+from aiogram.types import ErrorEvent, Message, PreCheckoutQuery, SuccessfulPayment
+from aiogram_stars import SUBSCRIPTION_PERIOD, RejectPayment, StarsPayments
+from aiogram_stars import Checkout as StarsCheckout
+from aiogram_stars import Payment as StarsPayment
+from aiogram_stars.sqlalchemy import SqlAlchemyStorage
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -55,7 +69,6 @@ from paidclub.billing.base import (
     WebhookEvent,
     WebhookRejected,
 )
-from paidclub.config import STARS_SUBSCRIPTION_PERIOD
 from paidclub.container import Core
 from paidclub.db import in_transaction, insert_ignore
 from paidclub.domain.subscriptions import SubStatus
@@ -68,16 +81,14 @@ log = logging.getLogger(__name__)
 
 PROVIDER_NAME = "stars"
 CURRENCY = "XTR"
-#: The only period the Bot API accepts for ``subscription_period`` (30 days).
-SUBSCRIPTION_PERIOD_SECONDS = int(STARS_SUBSCRIPTION_PERIOD.total_seconds())
 #: Bot API limit for the price of one subscription period.
 MAX_SUBSCRIPTION_PRICE = 10_000
-#: Every invoice payload we create starts with this, so other invoices of the same bot are
-#: left to other handlers.
-PAYLOAD_PREFIX = "paidclub:"
+#: The unsigned payloads of invoices made before aiogram-stars signed them.
+LEGACY_PREFIX = "paidclub:"
 TITLE_MAX_LENGTH = 32
 DESCRIPTION_MAX_LENGTH = 255
-#: Telegram cancels the payment if the pre-checkout query is not answered within 10 seconds.
+#: Seconds the pre-checkout check may take. Telegram cancels the payment if the query is not
+#: answered within 10 seconds; aiogram-stars declines it when the check runs out of time.
 PRE_CHECKOUT_TIMEOUT = 5.0
 
 # Shown by Telegram in the payment window when a pre-checkout query is declined.
@@ -95,23 +106,36 @@ NOT_APPLIED_NOTICE = (
 
 
 @dataclass(frozen=True, slots=True)
-class InvoicePayload:
+class InvoiceOrder:
+    """What a Stars invoice is for; aiogram-stars signs it into the payload as the order id."""
+
     subscription_id: int
     #: The period this invoice was created for. Renewals carry the payload of the first
     #: invoice, so this is only meaningful for the first payment.
     for_period: int
 
-    def encode(self) -> str:
-        return f"{PAYLOAD_PREFIX}{self.subscription_id}:{self.for_period}"
+    @property
+    def order_id(self) -> str:
+        return f"{self.subscription_id}:{self.for_period}"
 
     @classmethod
-    def decode(cls, payload: str) -> InvoicePayload | None:
-        if not payload.startswith(PAYLOAD_PREFIX):
-            return None
-        sub, _, period = payload.removeprefix(PAYLOAD_PREFIX).partition(":")
+    def parse(cls, order_id: str) -> InvoiceOrder | None:
+        sub, _, period = order_id.partition(":")
         if not (sub.isdigit() and period.isdigit()):
             return None
         return cls(int(sub), int(period))
+
+    @classmethod
+    def from_payload(cls, payload: str) -> InvoiceOrder | None:
+        """The order in a payload, signed or from before signing.
+
+        The signature is not checked here: aiogram-stars checked it before the payment was
+        stored, and a payload from before signing is recognised by its prefix.
+        """
+        if payload.startswith(LEGACY_PREFIX):
+            return cls.parse(payload.removeprefix(LEGACY_PREFIX))
+        order_id, dot, _signature = payload.rpartition(".")
+        return cls.parse(order_id) if dot else None
 
 
 def payment_event(payment: SuccessfulPayment, *, occurred_at: datetime) -> PaymentSucceeded | None:
@@ -123,8 +147,8 @@ def payment_event(payment: SuccessfulPayment, *, occurred_at: datetime) -> Payme
     Telegram subscription and names no period. The period end comes from
     ``subscription_expiration_date``, because Telegram decides when the period ends.
     """
-    payload = InvoicePayload.decode(payment.invoice_payload)
-    if payload is None or payment.currency != CURRENCY:
+    order = InvoiceOrder.from_payload(payment.invoice_payload)
+    if order is None or payment.currency != CURRENCY:
         return None
     first = bool(payment.is_first_recurring) or not payment.is_recurring
     expires = payment.subscription_expiration_date
@@ -132,11 +156,11 @@ def payment_event(payment: SuccessfulPayment, *, occurred_at: datetime) -> Payme
     return PaymentSucceeded(
         provider=PROVIDER_NAME,
         provider_payment_id=payment.telegram_payment_charge_id,
-        subscription_id=payload.subscription_id,
+        subscription_id=order.subscription_id,
         amount=Money(payment.total_amount, CURRENCY),
         occurred_at=occurred_at,
         purpose=PaymentPurpose.CHECKOUT if first else PaymentPurpose.RENEWAL,
-        for_period=payload.for_period if first else None,
+        for_period=order.for_period if first else None,
         period_end=datetime.fromtimestamp(expires, UTC) if expires else None,
         payment_method_id=payment.telegram_payment_charge_id if first and subscription else None,
     )
@@ -147,15 +171,16 @@ class StarsProvider:
 
     Telegram renews on its own (``supports_merchant_renewal = False``), so ``charge_renewal``
     is never called and there are no webhooks: payments arrive as bot updates, handled by
-    :func:`create_stars_router`.
+    :func:`create_stars_router`. Invoices and subscription changes go through ``payments``.
     """
 
     name = PROVIDER_NAME
     currency = CURRENCY
     supports_merchant_renewal = False
 
-    def __init__(self, bot: Bot) -> None:
+    def __init__(self, bot: Bot, payments: StarsPayments) -> None:
         self.bot = bot
+        self.payments = payments
 
     async def start_checkout(self, request: CheckoutRequest) -> Checkout:
         if request.amount.currency != CURRENCY:
@@ -165,15 +190,16 @@ class StarsProvider:
                 f"a Stars subscription costs 1 to {MAX_SUBSCRIPTION_PRICE} Stars per period, "
                 f"plan {request.plan_code!r} asks for {request.amount.minor}"
             )
-        payload = InvoicePayload(request.subscription_id, request.for_period).encode()
+        order = InvoiceOrder(request.subscription_id, request.for_period)
         try:
-            link = await self.bot.create_invoice_link(
+            link = await self.payments.create_invoice_link(
+                self.bot,
+                order_id=order.order_id,
+                amount=request.amount.minor,
                 title=request.plan_title[:TITLE_MAX_LENGTH],
                 description=request.description[:DESCRIPTION_MAX_LENGTH],
-                payload=payload,
-                currency=CURRENCY,
-                prices=[LabeledPrice(label=request.plan_title, amount=request.amount.minor)],
-                subscription_period=SUBSCRIPTION_PERIOD_SECONDS,
+                label=request.plan_title,
+                subscription_period=SUBSCRIPTION_PERIOD,
             )
         except TelegramAPIError as exc:
             raise ProviderError(f"createInvoiceLink failed: {exc}") from exc
@@ -202,10 +228,8 @@ class StarsProvider:
             log.warning("subscription %s has no Stars charge id to cancel", ref.subscription_id)
             return
         try:
-            await self.bot.edit_user_star_subscription(
-                user_id=ref.member_telegram_id,
-                telegram_payment_charge_id=ref.payment_method_id,
-                is_canceled=True,
+            await self.payments.cancel_subscription(
+                self.bot, ref.payment_method_id, user_id=ref.member_telegram_id
             )
         except TelegramBadRequest as exc:
             log.warning(
@@ -228,10 +252,8 @@ class StarsProvider:
         if ref.payment_method_id is None:
             raise ProviderError(f"subscription {ref.subscription_id} has no Stars charge id")
         try:
-            await self.bot.edit_user_star_subscription(
-                user_id=ref.member_telegram_id,
-                telegram_payment_charge_id=ref.payment_method_id,
-                is_canceled=False,
+            await self.payments.cancel_subscription(
+                self.bot, ref.payment_method_id, user_id=ref.member_telegram_id, is_canceled=False
             )
         except TelegramAPIError as exc:
             raise ProviderError(f"editUserStarSubscription failed: {exc}") from exc
@@ -241,16 +263,17 @@ class StarsProvider:
 
 
 async def check_pre_checkout(
-    core: Core, *, user_id: int, currency: str, total_amount: int, payload: str
+    core: Core, *, user_id: int, currency: str, total_amount: int, order_id: str
 ) -> str | None:
-    """Decide a pre-checkout query: ``None`` to accept, or the error to show the member.
+    """Decide a pre-checkout query whose payload verified: ``None`` to accept, or the error
+    to show the member.
 
     Telegram allows several concurrent subscriptions per user, so this is where a second
     payment for an already paid period is stopped: an old invoice link opened again, or a new
     invoice while another subscription is live. Two payments racing past this check are still
     caught when applied, because a first payment names the period of its invoice.
     """
-    parsed = InvoicePayload.decode(payload)
+    parsed = InvoiceOrder.parse(order_id)
     if parsed is None:
         return ERROR_INVALID
     async with core.sessions() as session:
@@ -269,29 +292,46 @@ async def check_pre_checkout(
     return None
 
 
-async def answer_pre_checkout(
-    core: Core, query: PreCheckoutQuery, *, within: float = PRE_CHECKOUT_TIMEOUT
-) -> str | None:
-    """Check and answer a pre-checkout query in time; returns the error shown, if any.
+def stars_payments(
+    core: Core,
+    *,
+    secret: str,
+    pre_checkout_timeout: float = PRE_CHECKOUT_TIMEOUT,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+) -> StarsPayments:
+    """aiogram-stars for the club's invoices, keeping its records in the club's database.
 
-    If the check cannot finish (database down or slow), the payment is declined: declining
-    moves no money and the member can simply try again.
+    ``secret`` signs the payloads (``PAIDCLUB_STARS_PAYLOAD_SECRET``). A check that cannot
+    finish in ``pre_checkout_timeout`` seconds (database down or slow) declines the payment
+    with :data:`ERROR_UNAVAILABLE`: declining moves no money and the member can try again.
     """
-    error: str | None
-    try:
-        async with asyncio.timeout(within):
-            error = await check_pre_checkout(
-                core,
-                user_id=query.from_user.id,
-                currency=query.currency,
-                total_amount=query.total_amount,
-                payload=query.invoice_payload,
-            )
-    except Exception:
-        log.exception("pre-checkout check for %r failed", query.invoice_payload)
-        error = ERROR_UNAVAILABLE
-    await query.answer(ok=error is None, error_message=error)
-    return error
+
+    async def check(checkout: StarsCheckout) -> None:
+        error = await check_pre_checkout(
+            core,
+            user_id=checkout.user_id,
+            currency=checkout.query.currency,
+            total_amount=checkout.amount,
+            order_id=checkout.order_id,
+        )
+        if error is not None:
+            raise RejectPayment(error)
+
+    async def on_paid(payment: StarsPayment, message: Message) -> None:
+        if InvoiceOrder.parse(payment.order_id) is None:
+            # Signed with the club's secret, yet not for a subscription period.
+            raise RejectPayment(ERROR_INVALID)
+        await _on_payment(core, message, user_id=payment.user_id, sleep=sleep)
+
+    return StarsPayments(
+        SqlAlchemyStorage(core.engine),
+        secret=secret,
+        on_paid=on_paid,
+        check=check,
+        checkout_timeout=pre_checkout_timeout,
+        checkout_error=ERROR_UNAVAILABLE,
+        clock=core.clock.now,
+    )
 
 
 class PaymentNotStored(Exception):
@@ -326,7 +366,7 @@ async def handle_successful_payment(
     is handled. So the update is stored first, in its own short transaction (retried a few
     times); if applying it fails afterwards, the scheduler applies the stored row later
     (:func:`retry_stored_payments`). Raises :class:`PaymentNotStored` if even storing fails:
-    the caller then tells the owner directly, outside the database.
+    the router's error handler then tells the owner directly, outside the database.
 
     Returns ``None`` for payments that are not ours, and while a stored payment waits for a
     retry.
@@ -535,49 +575,107 @@ async def retry_stored_payments(core: Core, *, batch_size: int = 50) -> int:
     return applied
 
 
+async def _on_payment(
+    core: Core, message: Message, *, user_id: int, sleep: Callable[[float], Awaitable[None]]
+) -> None:
+    payment = message.successful_payment
+    assert payment is not None  # the handlers only take payments
+    result = await handle_successful_payment(
+        core, payment, user_id=user_id, occurred_at=message.date.astimezone(UTC), sleep=sleep
+    )
+    await _tell_member_if_not_applied(message, result)
+
+
+async def _tell_member_if_not_applied(message: Message, result: ApplyResult | None) -> None:
+    if result is None or result.outcome is not PaymentOutcome.NEEDS_REFUND:
+        return
+    try:
+        await message.answer(NOT_APPLIED_NOTICE)
+    except TelegramAPIError:
+        log.warning("could not tell %s about the unapplied payment", message.chat.id)
+
+
+async def _is_stored(core: Core, charge_id: str) -> bool:
+    try:
+        async with core.sessions() as session:
+            row = await session.scalar(
+                select(StarsPaymentUpdate.id).where(
+                    StarsPaymentUpdate.telegram_payment_charge_id == charge_id
+                )
+            )
+    except Exception:
+        log.exception("could not look up whether Stars payment %s is stored", charge_id)
+        return False
+    return row is not None
+
+
+async def _report_unstored(core: Core, bot: Bot, event: ErrorEvent) -> None:
+    """Tell the owner directly about a payment that failed before it was stored.
+
+    The database is unreachable then, so the outbox is too. A payment that is stored already
+    is applied by the scheduler and needs no alert.
+    """
+    message = event.update.message
+    assert message is not None
+    payment = message.successful_payment
+    assert payment is not None  # the handler's filter
+    error = event.exception
+    if isinstance(error, PaymentNotStored):
+        unstored = error  # logged by _store
+    elif await _is_stored(core, payment.telegram_payment_charge_id):
+        return
+    else:
+        user_id = message.from_user.id if message.from_user else message.chat.id
+        unstored = PaymentNotStored(payment, user_id)
+        log.critical(
+            "Stars payment NOT stored: charge %s, payload %r, %s XTR, user %s, expires %s",
+            payment.telegram_payment_charge_id,
+            payment.invoice_payload,
+            payment.total_amount,
+            user_id,
+            payment.subscription_expiration_date,
+            exc_info=error,
+        )
+    if core.settings.owner_id is None:
+        return
+    try:
+        await bot.send_message(chat_id=core.settings.owner_id, text=unstored.owner_text())
+    except TelegramAPIError:
+        log.exception("could not tell the owner about an unstored Stars payment")
+
+
 def create_stars_router(
     core: Core,
+    payments: StarsPayments,
     *,
-    pre_checkout_timeout: float = PRE_CHECKOUT_TIMEOUT,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> Router:
-    """Handlers for Stars invoices created by :class:`StarsProvider`.
+    """The Stars handlers: those of ``payments`` (aiogram-stars) and the club's own.
 
-    Include it in the dispatcher (``dp.include_router(create_stars_router(core))``) and
-    register the provider (``core.providers.register(StarsProvider(bot))``). Both handlers only
-    react to our invoice payloads.
+    Include it in the dispatcher (``dp.include_router(create_stars_router(core, payments))``)
+    and register the provider (``core.providers.register(StarsProvider(bot, payments))``).
+    aiogram-stars takes every pre-checkout query and payment in XTR; the handlers registered
+    here run before it, for payloads from before signing, and an error handler tells the
+    owner about a payment that failed before it was stored.
     """
     router = Router(name="paidclub-stars")
 
-    @router.pre_checkout_query(F.invoice_payload.startswith(PAYLOAD_PREFIX))
-    async def on_pre_checkout(query: PreCheckoutQuery) -> None:
-        await answer_pre_checkout(core, query, within=pre_checkout_timeout)
+    @router.pre_checkout_query(F.currency == CURRENCY, F.invoice_payload.startswith(LEGACY_PREFIX))
+    async def on_legacy_pre_checkout(query: PreCheckoutQuery) -> None:
+        await query.answer(ok=False, error_message=ERROR_STALE)
 
-    @router.message(F.successful_payment.invoice_payload.startswith(PAYLOAD_PREFIX))
-    async def on_successful_payment(message: Message, bot: Bot) -> None:
-        payment = message.successful_payment
-        if payment is None or message.from_user is None:
-            return
-        try:
-            result = await handle_successful_payment(
-                core,
-                payment,
-                user_id=message.from_user.id,
-                occurred_at=message.date.astimezone(UTC),
-                sleep=sleep,
-            )
-        except PaymentNotStored as exc:
-            # The database is unreachable, so the outbox is too: tell the owner directly.
-            if core.settings.owner_id is not None:
-                try:
-                    await bot.send_message(chat_id=core.settings.owner_id, text=exc.owner_text())
-                except TelegramAPIError:
-                    log.exception("could not tell the owner about an unstored Stars payment")
-            raise
-        if result is not None and result.outcome is PaymentOutcome.NEEDS_REFUND:
-            try:
-                await message.answer(NOT_APPLIED_NOTICE)
-            except TelegramAPIError:
-                log.warning("could not tell %s about the unapplied payment", message.from_user.id)
+    @router.message(
+        F.successful_payment.currency == CURRENCY,
+        F.successful_payment.invoice_payload.startswith(LEGACY_PREFIX),
+    )
+    async def on_legacy_payment(message: Message) -> None:
+        if message.from_user is not None:
+            await _on_payment(core, message, user_id=message.from_user.id, sleep=sleep)
 
+    @router.errors(F.update.message.successful_payment.currency == CURRENCY)
+    async def on_payment_error(event: ErrorEvent, bot: Bot) -> None:
+        await _report_unstored(core, bot, event)
+        raise SkipHandler  # the update still fails, and aiogram logs the error
+
+    payments.setup(router)
     return router

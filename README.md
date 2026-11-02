@@ -102,7 +102,8 @@ differ, it says so.
      `metadata` (subscription, member, period, purpose), under a fresh `Idempotence-Key`.
      The member gets `confirmation_url` as a button. The payment id goes into `checkouts`.
    - Stars: `createInvoiceLink(currency="XTR", prices=[one price],
-     subscription_period=2592000, payload="paidclub:<subscription>:<period>")`.
+     subscription_period=2592000, payload="<subscription>:<period>.<signature>")`. The
+     signature covers the order and the price, see [Providers](#providers).
    - Fake: a signed link to `/fake-checkout/<token>` on this app, a page where you choose
      whether the payment goes through and whether the card is saved for renewals.
 
@@ -117,9 +118,10 @@ differ, it says so.
    [`billing/yookassa.py`](src/paidclub/billing/yookassa.py),
    [`checkouts.py`](src/paidclub/checkouts.py).
    - Stars: Telegram first sends `pre_checkout_query`. The bot answers it within 5 seconds
-     (Telegram allows 10) after checking the payload, the payer, the amount and that the
-     period is not paid yet. Then comes `successful_payment`. It is stored in
-     `stars_payment_updates` before it is applied, because Telegram delivers it only once.
+     (Telegram allows 10) after checking the payload's signature, the payer, the amount and
+     that the period is not paid yet. Then comes `successful_payment`. It is recorded once per
+     charge id, then stored in `stars_payment_updates` before it is applied, because Telegram
+     delivers it only once.
      `subscription_expiration_date` sets the period end, and the first
      `telegram_payment_charge_id` is kept for cancelling later.
 4. **Activation.** One transaction records the payment, moves the subscription from `pending`
@@ -182,16 +184,22 @@ The state machine, the tables, one scheduler pass and every idempotency key are 
 | Price limit | none in this code | at most 10000 Stars per period (Bot API) | none |
 | First payment | YooKassa's page (`confirmation.type = redirect`), card saved with `save_payment_method: true` | Invoice link opened in Telegram | Local page `/fake-checkout/<token>` with four outcomes |
 | Renewals | Charged by the app: `payment_method_id` plus `Idempotence-Key` | Charged by Telegram, arrive as `successful_payment` with `is_recurring` | Charged by the app against a "saved card" that either always pays or always declines |
-| How a payment is confirmed | Body not trusted: `GET /v3/payments/{id}` with the shop credentials | Bot updates from Telegram, `pre_checkout_query` checked first | HMAC-SHA256 signature in `X-Fake-Signature` |
+| How a payment is confirmed | Body not trusted: `GET /v3/payments/{id}` with the shop credentials | Bot updates from Telegram, with an HMAC-SHA256 signature in the invoice payload; `pre_checkout_query` checked first | HMAC-SHA256 signature in `X-Fake-Signature` |
 | Missed or failed notification | Payment looked up by id for up to 48 hours | The update is stored before it is applied, and the scheduler retries one that failed to apply. Stars payments are not looked up | The page sends its own notification |
 | Failed renewal | Retried 1 and 3 days after the first failure | Telegram sends nothing. A renewal missing 60 minutes after the period end counts as failed | Retried like YooKassa |
 | Cancel | Our side only: there is no subscription at YooKassa | `editUserStarSubscription(is_canceled=True)` | Our side only |
-| Refunds | Made by the owner in the YooKassa dashboard. `refund.succeeded` is confirmed with `GET /v3/refunds/{id}`, then auto-renew is turned off and the card forgotten | Not made by the app (`refundStarPayment` is not called). The owner is alerted when a payment needs one | None |
+| Refunds | Made by the owner in the YooKassa dashboard. `refund.succeeded` is confirmed with `GET /v3/refunds/{id}`, then auto-renew is turned off and the card forgotten | A paid invoice whose payload does not verify is refunded with `refundStarPayment`, retried until Telegram confirms. Any other refund is the owner's call; the owner is alerted when a payment needs one | None |
 | What the shop needs | Shop id and secret key. **Autopayments work by default only in a test shop; a live shop needs a YooKassa manager to enable them.** Notifications go only to HTTPS on port 443 or 8443 | Nothing: Stars go to the bot's balance | Nothing. No money moves, and anyone with a link can "pay" |
 
 The fake provider is refused when `PAIDCLUB_ENV=prod`. `paidclub run` and `paidclub web` also
 refuse it next to a real provider, or with club chats on a public `PAIDCLUB_PUBLIC_BASE_URL`,
 unless `PAIDCLUB_DEMO=1` says it is a demo on purpose.
+
+Stars handling uses [aiogram-stars](https://github.com/sinnercode228/aiogram-stars): it signs
+the invoice payloads, answers `pre_checkout_query` in time, records each payment once per
+`telegram_payment_charge_id` before the club applies it, and sends its refunds. Its tables are
+`stars_payments` and `stars_refunds`. Renewals of subscriptions bought before the payloads
+were signed still apply. Code: [`billing/stars.py`](src/paidclub/billing/stars.py).
 
 All three implement one protocol in [`billing/base.py`](src/paidclub/billing/base.py): start a
 checkout, charge a renewal, look a payment up, parse and verify a webhook, cancel, resume.
@@ -297,8 +305,8 @@ renewals are always declined.
   to `{PAIDCLUB_PUBLIC_BASE_URL}/webhooks/yookassa/<token>` (`paidclub check` prints this URL) with
   the events `payment.succeeded`, `payment.canceled` and `refund.succeeded`. A test shop has
   autopayments on. A live shop gets them only after a YooKassa manager enables them.
-- Stars: put `stars` in `PAIDCLUB_PROVIDERS`. The default monthly plan has `price_stars: 500`.
-  No credentials are needed.
+- Stars: put `stars` in `PAIDCLUB_PROVIDERS` and a random `PAIDCLUB_STARS_PAYLOAD_SECRET`. The
+  default monthly plan has `price_stars: 500`. No credentials are needed.
 
 `PAIDCLUB_PROVIDERS=yookassa,stars` offers both, in that order.
 
@@ -337,6 +345,7 @@ problem.
 | `PAIDCLUB_DUNNING_RETRY_DAYS` | `1,3` | Retries, in days after the first failure. Ascending, and the last one inside the grace period. |
 | `PAIDCLUB_REMINDER_DAYS` | `3,1` | Reminders, in days before a renewal or the end of access. |
 | `PAIDCLUB_STARS_RENEWAL_WAIT_MINUTES` | `60` | How long after the period end a Stars renewal is waited for before it counts as failed. |
+| `PAIDCLUB_STARS_PAYLOAD_SECRET` | not set | Required with `stars`, at least 16 characters. Signs Stars invoice payloads. Renewals carry the payload of the first invoice, so keep it while any Stars subscription is active. |
 | `PAIDCLUB_FAKE_WEBHOOK_SECRET` | random at every start | Signs the fake provider's checkout links and webhooks. Set it, or links from before a restart stop working. |
 | `PAIDCLUB_YOOKASSA_SHOP_ID` | not set | Shop id from the YooKassa dashboard. |
 | `PAIDCLUB_YOOKASSA_SECRET_KEY` | not set | Secret key from the YooKassa dashboard. |
@@ -437,8 +446,9 @@ Things this code does not do, or that need care before a real club runs on it.
   off "add members" for members. The bot reports a public username and that permission, but
   changes neither.
 - **Stars.** Monthly only. A failed renewal produces no update, so it is noticed 60 minutes
-  after the period end. Stars refunds are left to the owner. Turning renewal back on needs the
-  member to do it in Telegram.
+  after the period end. Only payments whose payload does not verify are refunded by the app;
+  other refunds are left to the owner. Turning renewal back on needs the member to do it in
+  Telegram.
 - **Refunds and revenue.** A refund made in the YooKassa dashboard turns auto-renew off and
   forgets the card, and access lasts to the period end. Revenue on the dashboard is gross:
   refunds are recorded but not subtracted.

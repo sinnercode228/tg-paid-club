@@ -4,7 +4,7 @@ Entry points build it once with :func:`build_core` and register the providers th
 objects only they have (the Stars provider needs the aiogram ``Bot``)::
 
     core = await build_core(settings)
-    core.providers.register(StarsProvider(bot, ...))
+    core.providers.register(StarsProvider(bot, stars_payments(core, secret=...)))
 """
 
 from __future__ import annotations
