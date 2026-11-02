@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
+from paidclub.billing.tonaddress import InvalidAddress, TonAddress
 from paidclub.domain.subscriptions import BillingPolicy, PeriodUnit
 from paidclub.money import CURRENCY_EXPONENTS, Money
 
@@ -253,6 +254,27 @@ class Settings(BaseSettings):
     #: day, so it has expired while its checkout is still looked up.
     cryptopay_invoice_lifetime_minutes: int = Field(default=60, ge=1, le=1440)
 
+    # --- usdt on ton -----------------------------------------------------------------------
+    #: The owner's TON wallet members send USDT to, in any form (``UQ...``, ``EQ...``,
+    #: ``0:...``). Keep it for the club alone: every transfer that matches no checkout is
+    #: reported to the owner.
+    ton_wallet_address: str | None = None
+    #: toncenter API root, with the indexer under ``/v3`` and get-methods under ``/v2``;
+    #: ``https://testnet.toncenter.com/api`` for the testnet.
+    ton_api_url: str = "https://toncenter.com/api"
+    #: Sent as ``X-API-Key``. Without one toncenter allows about one request a second.
+    ton_api_key: SecretStr | None = None
+    #: The jetton members pay with: the official USDT master. Change it only on the testnet.
+    ton_jetton_master: str = "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs"
+    #: Decimal places of that jetton (USDT: 6).
+    ton_jetton_decimals: int = Field(default=6, ge=2, le=18)
+    #: While a TON checkout waits, the wallet is asked at most this often, and at most once
+    #: per scheduler pass.
+    ton_poll_seconds: float = Field(default=15, gt=0)
+    #: A TON checkout nothing was paid for expires after this long; a partial payment extends
+    #: it by as much again.
+    ton_invoice_lifetime_minutes: int = Field(default=60, ge=5, le=1440)
+
     # --- workers ---------------------------------------------------------------------------
     scheduler_interval_seconds: float = Field(default=30, gt=0)
     #: How long a worker owns a claimed renewal or notification before another may take it.
@@ -369,6 +391,19 @@ class Settings(BaseSettings):
         if len(assets) != len(set(assets)):
             raise ValueError("coins must not repeat")
         return assets
+
+    @field_validator("ton_wallet_address", "ton_jetton_master")
+    @classmethod
+    def _check_ton_address(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        try:
+            TonAddress.parse(value)
+        except InvalidAddress as exc:
+            raise ValueError(
+                "must be a TON address like UQ..., EQ... or 0:<64 hex digits>"
+            ) from exc
+        return value.strip()
 
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:

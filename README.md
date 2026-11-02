@@ -385,6 +385,13 @@ problem.
 | `PAIDCLUB_CRYPTOPAY_API_URL` | `https://pay.crypt.bot/api` | Crypto Pay API base URL. `https://testnet-pay.crypt.bot/api` for the testnet, where the coins are not real. |
 | `PAIDCLUB_CRYPTOPAY_ASSETS` | `USDT,TON` | Coins an invoice can be paid with, as Crypto Pay names them (`USDT`, `TON`, `BTC`, …). The price is in dollars either way. |
 | `PAIDCLUB_CRYPTOPAY_INVOICE_LIFETIME_MINUTES` | `60` | An unpaid invoice expires after this long (1–1440), and the member asks for a new one. |
+| `PAIDCLUB_TON_WALLET_ADDRESS` | not set | Your own TON wallet that members send USDT to: `UQ…`, `EQ…` or `0:…`. Use one for the club alone, since every transfer that matches no checkout is reported to you. |
+| `PAIDCLUB_TON_API_URL` | `https://toncenter.com/api` | toncenter, with the indexer under `/v3` and get-methods under `/v2`. `https://testnet.toncenter.com/api` for the testnet. |
+| `PAIDCLUB_TON_API_KEY` | not set | toncenter API key, sent as `X-API-Key`. Without one toncenter allows about one request a second. |
+| `PAIDCLUB_TON_JETTON_MASTER` | `EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs` | The jetton members pay with: the official USDT master. Change it only on the testnet. |
+| `PAIDCLUB_TON_JETTON_DECIMALS` | `6` | Decimal places of that jetton (USDT has 6). |
+| `PAIDCLUB_TON_POLL_SECONDS` | `15` | While a TON checkout waits, the wallet is read at most this often, and at most once per scheduler pass. |
+| `PAIDCLUB_TON_INVOICE_LIFETIME_MINUTES` | `60` | A TON checkout nothing was paid for expires after this long (5–1440). A partial payment extends it by as much again. |
 | `PAIDCLUB_SCHEDULER_INTERVAL_SECONDS` | `30` | Time between scheduler passes. |
 | `PAIDCLUB_CLAIM_LEASE_SECONDS` | `300` | How long a worker owns a claimed renewal, removal or message before another worker may take it over. |
 | `PAIDCLUB_PROVIDER_RETRY_SECONDS` | `300` | After a provider error (timeout, 5xx), when the same charge is tried again. |

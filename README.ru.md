@@ -385,6 +385,13 @@ PAIDCLUB_DUNNING_RETRY_DAYS=0.25,0.5
 | `PAIDCLUB_CRYPTOPAY_API_URL` | `https://pay.crypt.bot/api` | Адрес API Crypto Pay. Для тестовой сети, где монеты ненастоящие, — `https://testnet-pay.crypt.bot/api`. |
 | `PAIDCLUB_CRYPTOPAY_ASSETS` | `USDT,TON` | Монеты, которыми можно оплатить счёт, в написании Crypto Pay (`USDT`, `TON`, `BTC`, …). Цена в любом случае в долларах. |
 | `PAIDCLUB_CRYPTOPAY_INVOICE_LIFETIME_MINUTES` | `60` | Через сколько минут неоплаченный счёт истекает (от 1 до 1440); тогда участник запрашивает новый. |
+| `PAIDCLUB_TON_WALLET_ADDRESS` | не задан | Ваш собственный TON-кошелёк, на который участники переводят USDT: `UQ…`, `EQ…` или `0:…`. Заведите его только для клуба: о каждом переводе, который не подошёл ни к одной оплате, бот сообщает вам. |
+| `PAIDCLUB_TON_API_URL` | `https://toncenter.com/api` | toncenter: индексатор под `/v3`, get-методы под `/v2`. Для тестовой сети — `https://testnet.toncenter.com/api`. |
+| `PAIDCLUB_TON_API_KEY` | не задан | Ключ API toncenter, отправляется в `X-API-Key`. Без него toncenter пропускает примерно один запрос в секунду. |
+| `PAIDCLUB_TON_JETTON_MASTER` | `EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs` | Жетон, которым платят участники: официальный мастер USDT. Менять — только в тестовой сети. |
+| `PAIDCLUB_TON_JETTON_DECIMALS` | `6` | Сколько знаков после запятой у этого жетона (у USDT — 6). |
+| `PAIDCLUB_TON_POLL_SECONDS` | `15` | Пока оплата в TON ждёт перевода, кошелёк проверяется не чаще этого и не чаще одного раза за проход планировщика. |
+| `PAIDCLUB_TON_INVOICE_LIFETIME_MINUTES` | `60` | Через сколько минут истекает оплата в TON, по которой ничего не пришло (от 5 до 1440). Частичная оплата продлевает её ещё на столько же. |
 | `PAIDCLUB_SCHEDULER_INTERVAL_SECONDS` | `30` | Пауза между проходами планировщика. |
 | `PAIDCLUB_CLAIM_LEASE_SECONDS` | `300` | Сколько секунд воркер держит взятое продление, удаление или сообщение, прежде чем его сможет забрать другой. |
 | `PAIDCLUB_PROVIDER_RETRY_SECONDS` | `300` | Через сколько секунд после ошибки провайдера (таймаут, 5xx) повторить то же списание. |
