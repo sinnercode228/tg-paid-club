@@ -22,6 +22,7 @@ from aiogram.methods import (
 from aiogram.methods.base import TelegramType
 from aiogram.types import LabeledPrice, SuccessfulPayment, Update, User
 from aiogram_stars import PaymentStatus, StarsPayments
+from aiogram_stars.sqlalchemy import SqlAlchemyStorage
 from pydantic import SecretStr
 from sqlalchemy import event, select
 from sqlalchemy.exc import OperationalError
@@ -1028,17 +1029,81 @@ async def test_a_stored_payment_that_never_applies_is_given_up_with_an_owner_ale
     assert "ch_1" in alert.text
 
 
+async def test_a_charge_that_meets_one_database_error_is_still_recorded_and_applied(
+    core: Core,
+    session: RecordingSession,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    clock: FakeClock,
+    payments_lib: StarsPayments,
+) -> None:
+    """aiogram-stars records the charge before the club sees it, and Telegram does not deliver
+    the update again: one "database is locked" there must not leave the subscription unpaid."""
+    sub_id, payload = await stars_invoice(core, session)
+    expires = clock.now() + THIRTY_DAYS
+    with failing_inserts(core, "stars_payments", times=1) as left:
+        await dispatcher.feed_update(
+            bot, payment_update(payload, charge_id="ch_1", expires=expires, first=True)
+        )
+    assert left == [0]
+
+    assert (await load_sub(core, sub_id)).status is SubStatus.ACTIVE
+    [row] = await stored_updates(core)
+    assert row.status is StarsPaymentStatus.APPLIED
+    recorded = await payments_lib.get_payment("ch_1")
+    assert recorded is not None and recorded.status is PaymentStatus.ACCEPTED
+    owner_id = core.settings.owner_id
+    assert [call for call in session.of(SendMessage) if call.chat_id == owner_id] == []
+
+
+async def test_a_charge_recorded_by_an_attempt_that_reported_an_error_is_not_lost(
+    core: Core,
+    session: RecordingSession,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    clock: FakeClock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The connection can drop after the INSERT was committed. The retry then finds the charge
+    held by its own claim, which is no repeated update, and the club still applies it."""
+    sub_id, payload = await stars_invoice(core, session)
+    claim = SqlAlchemyStorage.claim_payment
+    lost = [1]
+
+    async def claim_then_drop(self: SqlAlchemyStorage, *args: Any, **kwargs: Any) -> bool:
+        claimed = await claim(self, *args, **kwargs)
+        if lost[0]:
+            lost[0] -= 1
+            raise OperationalError("COMMIT", None, Exception("connection reset"))
+        return claimed
+
+    monkeypatch.setattr(SqlAlchemyStorage, "claim_payment", claim_then_drop)
+    await dispatcher.feed_update(
+        bot,
+        payment_update(payload, charge_id="ch_1", expires=clock.now() + THIRTY_DAYS, first=True),
+    )
+
+    assert lost == [0]
+    assert (await load_sub(core, sub_id)).status is SubStatus.ACTIVE
+    [row] = await stored_updates(core)
+    assert row.status is StarsPaymentStatus.APPLIED
+
+
 async def test_a_payment_that_cannot_even_be_recorded_reaches_the_owner_outside_the_database(
     core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot, clock: FakeClock
 ) -> None:
-    """aiogram-stars records the charge before the club sees it; when that fails, the club's
-    own store is never reached, and the owner still has to hear about the payment."""
+    """When aiogram-stars cannot record the charge even after the retries, the club's own store
+    is never reached, and the owner still has to hear about the payment."""
     _, payload = await stars_invoice(core, session)
     update_ = payment_update(
         payload, charge_id="ch_1", expires=clock.now() + THIRTY_DAYS, first=True
     )
-    with failing_inserts(core, "stars_payments", times=1), pytest.raises(OperationalError):
+    with (
+        failing_inserts(core, "stars_payments", times=100) as left,
+        pytest.raises(OperationalError),
+    ):
         await dispatcher.feed_update(bot, update_)
+    assert left == [100 - stars_module.STORE_ATTEMPTS]
 
     [alert] = [call for call in session.of(SendMessage) if call.chat_id == core.settings.owner_id]
     assert "ch_1" in alert.text and "500" in alert.text

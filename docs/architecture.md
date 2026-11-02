@@ -288,7 +288,7 @@ Tests that run these races: `tests/test_db.py::test_two_concurrent_claims_never_
 | between `banChatMember` and `unbanChatMember` | the ban ends by itself after 10 minutes; the retry finds a short ban it recognises as its own and lifts it at once. A ban without such an end was set by an admin and is left alone |
 | after Telegram accepted a message, before it was marked sent | the message is sent again once its lease runs out: the one place that is at least once rather than once |
 | while a Stars `successful_payment` is being applied | the update is already in `stars_payment_updates`; the scheduler applies it |
-| with the database down when a Stars payment arrives | storing is tried 4 times; then the owner gets a direct Telegram message with the charge id, outside the outbox, and the payment is logged at CRITICAL. The same happens when aiogram-stars cannot record the charge, before the club sees it |
+| with the database down when a Stars payment arrives | aiogram-stars records the charge in `stars_payments`, then the club stores the update; each write is tried 4 times. If either still fails, the owner gets a direct Telegram message with the charge id, outside the outbox, and the payment is logged at CRITICAL |
 | before a YooKassa checkout notification was handled | YooKassa sends it again for 24 hours, and the scheduler looks the payment up anyway |
 
 ## Stats

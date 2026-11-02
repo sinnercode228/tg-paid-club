@@ -24,9 +24,10 @@ The Telegram side is aiogram-stars (:func:`stars_payments`). It signs the invoic
 ``<subscription>:<period>.<signature>``, for that order and the price; answers
 ``pre_checkout_query`` in time with what :func:`check_pre_checkout` decides; records each
 ``successful_payment`` once per ``telegram_payment_charge_id`` (``stars_payments``) before the
-club sees it; and refunds a paid invoice whose payload does not verify, from its own outbox
-(``stars_refunds``). A payment that verifies but cannot be applied (a period paid twice) is not
-refunded automatically: core alerts the owner, who decides.
+club sees it, that first write retried by :class:`RetryingStarsStorage`; and refunds a paid
+invoice whose payload does not verify, from its own outbox (``stars_refunds``). A payment that
+verifies but cannot be applied (a period paid twice) is not refunded automatically: core alerts
+the owner, who decides.
 
 What a payment means for the club is decided here, and the provider never touches the
 database. Each payment is stored as it arrived (``stars_payment_updates``) before it is
@@ -54,8 +55,10 @@ from aiogram_stars import SUBSCRIPTION_PERIOD, RejectPayment, StarsPayments
 from aiogram_stars import Checkout as StarsCheckout
 from aiogram_stars import Payment as StarsPayment
 from aiogram_stars.sqlalchemy import SqlAlchemyStorage
+from aiogram_stars.sqlalchemy import metadata as stars_metadata
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from paidclub.billing.base import (
     ChargeResult,
@@ -292,6 +295,52 @@ async def check_pre_checkout(
     return None
 
 
+class RetryingStarsStorage(SqlAlchemyStorage):
+    """aiogram-stars' storage, with the first write of a payment retried like the club's own.
+
+    aiogram-stars records a charge (``claim_payment``) in one attempt, before ``on_paid`` runs,
+    and Telegram does not deliver the update again: a "database is locked" or a dropped
+    connection at that moment would leave the subscription unpaid. So the claim is tried
+    :data:`STORE_ATTEMPTS` times. An attempt that reported an error may still have committed;
+    a charge held by this claim's own token is then ours, not a repeated update.
+    """
+
+    _payments = stars_metadata.tables["stars_payments"]
+
+    def __init__(
+        self, engine: AsyncEngine, *, sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+    ) -> None:
+        super().__init__(engine)
+        self._db = engine
+        self._sleep = sleep
+
+    async def claim_payment(
+        self, payment: StarsPayment, *, token: str, now: datetime, until: datetime
+    ) -> bool:
+        for attempt in range(1, STORE_ATTEMPTS + 1):
+            try:
+                if attempt > 1 and await self._holds(payment.charge_id, token):
+                    return True
+                return await super().claim_payment(payment, token=token, now=now, until=until)
+            except (SQLAlchemyError, OSError):
+                if attempt == STORE_ATTEMPTS:
+                    raise  # the router's error handler tells the owner
+                log.warning(
+                    "recording Stars charge %s failed (%s/%s), retrying",
+                    payment.charge_id,
+                    attempt,
+                    STORE_ATTEMPTS,
+                )
+                await self._sleep(0.5 * 2 ** (attempt - 1))
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    async def _holds(self, charge_id: str, token: str) -> bool:
+        c = self._payments.c
+        async with self._db.connect() as conn:
+            holder = await conn.scalar(select(c.lease_token).where(c.charge_id == charge_id))
+        return holder == token
+
+
 def stars_payments(
     core: Core,
     *,
@@ -324,7 +373,7 @@ def stars_payments(
         await _on_payment(core, message, user_id=payment.user_id, sleep=sleep)
 
     return StarsPayments(
-        SqlAlchemyStorage(core.engine),
+        RetryingStarsStorage(core.engine, sleep=sleep),
         secret=secret,
         on_paid=on_paid,
         check=check,
@@ -386,7 +435,8 @@ async def handle_successful_payment(
         return None
 
 
-#: Storing a payment update is retried this many times before the owner is alerted.
+#: Recording a charge (aiogram-stars) and storing its update (the club) are each tried this
+#: many times before the owner is alerted.
 STORE_ATTEMPTS = 4
 #: Retries of a stored payment, with a delay doubling from one minute to an hour.
 APPLY_ATTEMPTS = 12
