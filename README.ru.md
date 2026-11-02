@@ -329,7 +329,7 @@ PAIDCLUB_DUNNING_RETRY_DAYS=0.25,0.5
 | `PAIDCLUB_ADMIN_PASSWORD` | не задан | Пароль basic auth для `/admin`. Если не задан ни он, ни токен, `/admin` отвечает 404. |
 | `PAIDCLUB_CHECKOUT_RETURN_URL` | не задан | Куда провайдер возвращает участника после оплаты. По умолчанию это `{PAIDCLUB_PUBLIC_BASE_URL}/paid` — страница, которая отправляет обратно в бот и ничего не обещает насчёт платежа. |
 | `PAIDCLUB_PLANS` | `month` 990 ₽, 500 ⭐ или 10 $, `quarter` 2490 ₽ или 25 $, `year` 8900 ₽ или 90 $ | Тарифы списком в JSON: `code`, `title`, `period_unit` (`month` или `day`), `period_count` (от 1 до 36), `price_rub` (строка вида `"990.00"`), `price_stars` (только у тарифов на месяц или 30 дней), `price_usd` (строка вида `"10.00"`, для оплаты криптовалютой). |
-| `PAIDCLUB_PROVIDERS` | `fake` | `yookassa`, `stars` и/или `fake`, в том порядке, в каком их видят участники. |
+| `PAIDCLUB_PROVIDERS` | `fake` | `yookassa`, `stars`, `cryptopay` и/или `fake`, в том порядке, в каком их видят участники. |
 | `PAIDCLUB_GRACE_DAYS` | `3` | Сколько дней доступ сохраняется после неудачного продления, пока идут повторы. |
 | `PAIDCLUB_DUNNING_RETRY_DAYS` | `1,3` | Повторные списания, в днях после первой неудачи. По возрастанию, последнее — внутри льготного периода. |
 | `PAIDCLUB_REMINDER_DAYS` | `3,1` | Напоминания, за сколько дней до продления или конца доступа. |
@@ -339,6 +339,10 @@ PAIDCLUB_DUNNING_RETRY_DAYS=0.25,0.5
 | `PAIDCLUB_YOOKASSA_SECRET_KEY` | не задан | Секретный ключ из личного кабинета ЮKassa. |
 | `PAIDCLUB_YOOKASSA_API_URL` | `https://api.yookassa.ru/v3` | Базовый адрес API ЮKassa. |
 | `PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN` | не задан | От 16 до 128 символов из `A-Z`, `a-z`, `0-9`, `_`, `-`. Если задан, уведомления принимаются только на `/webhooks/yookassa/<token>`, а запрос на любой другой адрес получает 404 ещё до обращения к API магазина. |
+| `PAIDCLUB_CRYPTOPAY_API_TOKEN` | не задан | Токен приложения Crypto Pay: в @CryptoBot, Crypto Pay → Create App. Для тестовой сети приложение создаётся в @CryptoTestnetBot. |
+| `PAIDCLUB_CRYPTOPAY_API_URL` | `https://pay.crypt.bot/api` | Адрес API Crypto Pay. Для тестовой сети, где монеты ненастоящие, — `https://testnet-pay.crypt.bot/api`. |
+| `PAIDCLUB_CRYPTOPAY_ASSETS` | `USDT,TON` | Монеты, которыми можно оплатить счёт, в написании Crypto Pay (`USDT`, `TON`, `BTC`, …). Цена в любом случае в долларах. |
+| `PAIDCLUB_CRYPTOPAY_INVOICE_LIFETIME_MINUTES` | `60` | Через сколько минут неоплаченный счёт истекает (от 1 до 1440); тогда участник запрашивает новый. |
 | `PAIDCLUB_SCHEDULER_INTERVAL_SECONDS` | `30` | Пауза между проходами планировщика. |
 | `PAIDCLUB_CLAIM_LEASE_SECONDS` | `300` | Сколько секунд воркер держит взятое продление, удаление или сообщение, прежде чем его сможет забрать другой. |
 | `PAIDCLUB_PROVIDER_RETRY_SECONDS` | `300` | Через сколько секунд после ошибки провайдера (таймаут, 5xx) повторить то же списание. |

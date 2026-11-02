@@ -353,7 +353,7 @@ class ChargeAttempt(Base):
 
 class Checkout(Base):
     """A payment page or invoice the member was sent to, when the provider created a payment
-    for it up front (YooKassa, the fake provider).
+    for it up front (YooKassa, a Crypto Pay invoice, the fake provider).
 
     A first payment is otherwise applied only when its notification arrives, and YooKassa
     stops retrying a notification after 24 hours. The scheduler looks each unsettled one up

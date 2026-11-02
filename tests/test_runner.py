@@ -19,6 +19,7 @@ from aiogram.methods.base import TelegramType
 from aiogram.types import Update
 from pydantic import SecretStr
 
+from paidclub.billing.cryptopay import CryptoPayProvider
 from paidclub.billing.yookassa import YooKassaProvider
 from paidclub.config import Settings
 from paidclub.runner import ClubApp, ComponentStopped, WebServer, build_app, serve
@@ -224,22 +225,26 @@ async def test_a_rejected_bot_token_stops_the_process(run_settings: Settings) ->
 async def test_providers_are_registered_from_settings(run_settings: Settings) -> None:
     settings = run_settings.model_copy(
         update={
-            "providers": ["fake", "yookassa", "stars"],
+            "providers": ["fake", "yookassa", "stars", "cryptopay"],
             "yookassa_shop_id": "123",
             "yookassa_secret_key": SecretStr("test_key"),
+            "cryptopay_api_token": SecretStr("1:test_token"),
         }
     )
     app = await build_app(settings, bot_session=MockedSession())
     yookassa = app.core.providers.require("yookassa")
+    cryptopay = app.core.providers.require("cryptopay")
     await app.aclose()
-    assert app.core.providers.names() == ["fake", "yookassa", "stars"]
+    assert app.core.providers.names() == ["fake", "yookassa", "cryptopay", "stars"]
     assert isinstance(yookassa, YooKassaProvider)
     assert yookassa._client.is_closed
+    assert isinstance(cryptopay, CryptoPayProvider)
+    assert cryptopay._client.is_closed
 
     web_only = await build_app(settings, with_bot=False)
     try:
-        # Stars needs the bot; YooKassa webhooks are still served.
-        assert web_only.core.providers.names() == ["fake", "yookassa"]
+        # Stars needs the bot; YooKassa and Crypto Pay webhooks are still served.
+        assert web_only.core.providers.names() == ["fake", "yookassa", "cryptopay"]
         assert web_only.bot is None
         assert web_only.scheduler is None
     finally:

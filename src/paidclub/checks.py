@@ -159,6 +159,13 @@ def startup_problems(settings: Settings, command: Command = "run") -> list[Probl
             f"{settings.public_base_url}/webhooks/yookassa/<token> as the notification URL in "
             "the shop settings, or let only YooKassa's addresses through at the proxy"
         )
+    if "cryptopay" in settings.providers and not settings.public_base_url.startswith("https://"):
+        warning(
+            "Crypto Pay posts webhooks to an HTTPS address, so "
+            f"{settings.public_base_url}/webhooks/cryptopay will not receive them: a paid "
+            "invoice is then applied only when it is looked up, 5 minutes after the checkout "
+            "and every 15 minutes after that"
+        )
     if command in ("run", "web") and not settings.demo:
         for message in _fake_provider_exposed(settings):
             error(message)
@@ -213,7 +220,7 @@ def _fake_provider_exposed(settings: Settings) -> list[str]:
         return [
             "PAIDCLUB_PROVIDERS=fake with club chats at a public "
             f"PAIDCLUB_PUBLIC_BASE_URL ({settings.public_base_url}): anyone could join through "
-            "the demo payment page without paying. Use yookassa or stars, or set "
+            "the demo payment page without paying. Use yookassa, stars or cryptopay, or set "
             "PAIDCLUB_DEMO=1 if this is a demo"
         ]
     return []
@@ -270,6 +277,16 @@ def describe(settings: Settings) -> list[str]:
                 + ("/<PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN>" if settings.yookassa_webhook_token else "")
             ]
             if "yookassa" in settings.providers
+            else []
+        ),
+        *(
+            [
+                f"cryptopay: {settings.cryptopay_api_url}"
+                + (" (testnet)" if "testnet" in settings.cryptopay_api_url else "")
+                + f", coins {', '.join(settings.cryptopay_assets)}, webhook URL "
+                f"{settings.public_base_url}/webhooks/cryptopay"
+            ]
+            if "cryptopay" in settings.providers
             else []
         ),
         f"plans: {'; '.join(plans)}",

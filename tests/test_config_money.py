@@ -86,6 +86,17 @@ def test_list_settings_accept_comma_separated_env_values(monkeypatch: pytest.Mon
     assert settings.plans[0].code == "week"
 
 
+def test_crypto_pay_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PAIDCLUB_PROVIDERS", "cryptopay,stars")
+    monkeypatch.setenv("PAIDCLUB_CRYPTOPAY_API_TOKEN", "12345:AAtoken")
+    monkeypatch.setenv("PAIDCLUB_CRYPTOPAY_ASSETS", "usdt, ton ,btc")
+    settings = make()
+    assert settings.providers == ["cryptopay", "stars"]
+    assert settings.cryptopay_assets == ["USDT", "TON", "BTC"]
+    assert settings.cryptopay_api_url == "https://pay.crypt.bot/api"
+    assert settings.cryptopay_invoice_lifetime_minutes == 60
+
+
 def test_billing_policy_from_settings() -> None:
     policy = make(grace_days=5, dunning_retry_days=[1, 2, 5], reminder_days=[1, 7]).billing_policy()
     assert policy.grace == timedelta(days=5)
@@ -110,6 +121,19 @@ def test_protected_users_are_the_owner_and_admins() -> None:
             {"providers": ["stars"], "plans": [{"code": "m", "title": "M", "price_rub": "1.00"}]},
             "price_stars",
         ),
+        ({"providers": ["cryptopay"]}, "cryptopay_api_token"),
+        (
+            {
+                "providers": ["cryptopay"],
+                "cryptopay_api_token": "1:x",
+                "plans": [{"code": "m", "title": "M", "price_rub": "1.00"}],
+            },
+            "price_usd",
+        ),
+        ({"cryptopay_assets": "USDT,USD T"}, "coin codes"),
+        ({"cryptopay_assets": "[]"}, "at least one coin"),
+        ({"cryptopay_assets": "TON,ton"}, "must not repeat"),
+        ({"cryptopay_invoice_lifetime_minutes": 1441}, "less than or equal to 1440"),
     ],
 )
 def test_inconsistent_settings_are_rejected(overrides: dict[str, Any], message: str) -> None:

@@ -332,7 +332,7 @@ problem.
 | `PAIDCLUB_ADMIN_PASSWORD` | not set | Basic auth password for `/admin`. With neither it nor the token set, `/admin` answers 404. |
 | `PAIDCLUB_CHECKOUT_RETURN_URL` | not set | Where a provider sends the member after paying. The default is `{PAIDCLUB_PUBLIC_BASE_URL}/paid`, a page that sends them back to the bot and promises nothing about the payment. |
 | `PAIDCLUB_PLANS` | `month` 990 ₽, 500 ⭐ or 10 $, `quarter` 2490 ₽ or 25 $, `year` 8900 ₽ or 90 $ | JSON list of plans: `code`, `title`, `period_unit` (`month` or `day`), `period_count` (1–36), `price_rub` (a string such as `"990.00"`), `price_stars` (1-month or 30-day plans only), `price_usd` (a string such as `"10.00"`, for crypto). |
-| `PAIDCLUB_PROVIDERS` | `fake` | `yookassa`, `stars` and/or `fake`, in the order members see them. |
+| `PAIDCLUB_PROVIDERS` | `fake` | `yookassa`, `stars`, `cryptopay` and/or `fake`, in the order members see them. |
 | `PAIDCLUB_GRACE_DAYS` | `3` | How long access lasts after a failed renewal while retries run. |
 | `PAIDCLUB_DUNNING_RETRY_DAYS` | `1,3` | Retries, in days after the first failure. Ascending, and the last one inside the grace period. |
 | `PAIDCLUB_REMINDER_DAYS` | `3,1` | Reminders, in days before a renewal or the end of access. |
@@ -342,6 +342,10 @@ problem.
 | `PAIDCLUB_YOOKASSA_SECRET_KEY` | not set | Secret key from the YooKassa dashboard. |
 | `PAIDCLUB_YOOKASSA_API_URL` | `https://api.yookassa.ru/v3` | YooKassa API base URL. |
 | `PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN` | not set | 16–128 characters of `A-Z`, `a-z`, `0-9`, `_`, `-`. When set, notifications are accepted only at `/webhooks/yookassa/<token>`, and anything posted elsewhere gets 404 before any request to the shop API. |
+| `PAIDCLUB_CRYPTOPAY_API_TOKEN` | not set | Token of a Crypto Pay app: in @CryptoBot, Crypto Pay → Create App. For the testnet, make the app in @CryptoTestnetBot. |
+| `PAIDCLUB_CRYPTOPAY_API_URL` | `https://pay.crypt.bot/api` | Crypto Pay API base URL. `https://testnet-pay.crypt.bot/api` for the testnet, where the coins are not real. |
+| `PAIDCLUB_CRYPTOPAY_ASSETS` | `USDT,TON` | Coins an invoice can be paid with, as Crypto Pay names them (`USDT`, `TON`, `BTC`, …). The price is in dollars either way. |
+| `PAIDCLUB_CRYPTOPAY_INVOICE_LIFETIME_MINUTES` | `60` | An unpaid invoice expires after this long (1–1440), and the member asks for a new one. |
 | `PAIDCLUB_SCHEDULER_INTERVAL_SECONDS` | `30` | Time between scheduler passes. |
 | `PAIDCLUB_CLAIM_LEASE_SECONDS` | `300` | How long a worker owns a claimed renewal, removal or message before another worker may take it over. |
 | `PAIDCLUB_PROVIDER_RETRY_SECONDS` | `300` | After a provider error (timeout, 5xx), when the same charge is tried again. |

@@ -22,7 +22,7 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from paidclub.domain.subscriptions import BillingPolicy, PeriodUnit
 from paidclub.money import CURRENCY_EXPONENTS, Money
 
-ProviderName = Literal["fake", "yookassa", "stars"]
+ProviderName = Literal["fake", "yookassa", "stars", "cryptopay"]
 
 #: Telegram Stars subscriptions renew every 30 days; it is the only period the Bot API accepts.
 STARS_SUBSCRIPTION_PERIOD = timedelta(days=30)
@@ -37,6 +37,8 @@ TELEGRAM_SECRET_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,256}")
 PATH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
 #: ``<bot id>:<secret>`` as @BotFather issues it.
 BOT_TOKEN_PATTERN = re.compile(r"[0-9]+:[A-Za-z0-9_-]+")
+#: A coin code as Crypto Pay writes it: ``USDT``, ``TON``, ``BTC``.
+ASSET_PATTERN = re.compile(r"[A-Z0-9]{2,10}")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 #: Accepted URL schemes and the async driver each one runs on.
 ASYNC_DRIVERS = {
@@ -237,6 +239,20 @@ class Settings(BaseSettings):
     #: forged notification sent anywhere else costs no request to the shop API.
     yookassa_webhook_token: SecretStr | None = None
 
+    # --- crypto pay ------------------------------------------------------------------------
+    #: Token of a Crypto Pay app: @CryptoBot, Crypto Pay, Create App (@CryptoTestnetBot for
+    #: the testnet).
+    cryptopay_api_token: SecretStr | None = None
+    #: ``https://testnet-pay.crypt.bot/api`` for the testnet, whose coins are not real.
+    cryptopay_api_url: str = "https://pay.crypt.bot/api"
+    #: Coins an invoice can be paid with. The price itself is in dollars (``price_usd``).
+    cryptopay_assets: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["USDT", "TON"]
+    )
+    #: An unpaid invoice expires after this long and the member asks for a new one. At most a
+    #: day, so it has expired while its checkout is still looked up.
+    cryptopay_invoice_lifetime_minutes: int = Field(default=60, ge=1, le=1440)
+
     # --- workers ---------------------------------------------------------------------------
     scheduler_interval_seconds: float = Field(default=30, gt=0)
     #: How long a worker owns a claimed renewal or notification before another may take it.
@@ -254,6 +270,7 @@ class Settings(BaseSettings):
         "providers",
         "dunning_retry_days",
         "reminder_days",
+        "cryptopay_assets",
         mode="before",
     )
     @classmethod
@@ -341,6 +358,18 @@ class Settings(BaseSettings):
             raise ValueError("must be 16-128 characters: letters A-Z, a-z, digits, _ and -")
         return value
 
+    @field_validator("cryptopay_assets")
+    @classmethod
+    def _check_assets(cls, value: list[str]) -> list[str]:
+        assets = [asset.strip().upper() for asset in value]
+        if not assets:
+            raise ValueError("name at least one coin, such as USDT")
+        if not all(ASSET_PATTERN.fullmatch(asset) for asset in assets):
+            raise ValueError(f"must be coin codes such as USDT,TON, got {value!r}")
+        if len(assets) != len(set(assets)):
+            raise ValueError("coins must not repeat")
+        return assets
+
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
         if any(day <= 0 for day in self.dunning_retry_days):
@@ -369,6 +398,10 @@ class Settings(BaseSettings):
             self.yookassa_shop_id and self.yookassa_secret_key
         ):
             raise ValueError("the yookassa provider needs yookassa_shop_id and yookassa_secret_key")
+        if "cryptopay" in self.providers and self.cryptopay_api_token is None:
+            raise ValueError("the cryptopay provider needs cryptopay_api_token")
+        if "cryptopay" in self.providers and not any(p.price_usd for p in self.plans):
+            raise ValueError("the cryptopay provider needs at least one plan with price_usd")
         if self.env == "prod" and "fake" in self.providers:
             raise ValueError("the fake provider is for demos and tests; disable it in prod")
         if self.bot_mode == "webhook":
