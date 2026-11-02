@@ -10,10 +10,13 @@ the provider registry and the billing policy.
 flowchart LR
     TG["Telegram"] -- "updates: /start, buttons, join requests, payments" --> BOT["aiogram dispatcher"]
     YK["YooKassa"] -- "POST /webhooks/yookassa" --> WEB["FastAPI app"]
+    CP["Crypto Pay"] -- "POST /webhooks/cryptopay, signed" --> WEB
+    WEB -- "getInvoices" --> CP
     BOT --> PAY["apply_payment_event"]
     WEB --> PAY
     SCH["Scheduler, every 30 s"] --> PAY
     SCH -- "POST /v3/payments, GET /v3/payments/{id}" --> YK
+    SCH -- "getInvoices" --> CP
     PAY --> DB[("SQLite or PostgreSQL")]
     BOT --> DB
     SCH --> DB
@@ -40,7 +43,7 @@ stateDiagram-v2
     [*] --> pending: plan and payment method chosen
     pending --> active: first payment
     active --> active: renewal paid, period extended from its end
-    active --> past_due: renewal declined, Stars renewal missing, or charge undecided at its deadline
+    active --> past_due: renewal declined or with nothing to charge (crypto), Stars renewal missing, or charge undecided at its deadline
     past_due --> past_due: retry declined, next retry scheduled
     past_due --> active: retry or pay button paid during grace
     past_due --> expired: grace over with no retry due, or auto-renew turned off or refunded
@@ -57,15 +60,15 @@ stateDiagram-v2
 | — | `pending` | The member picks a plan and a payment method. The plan's price and period are copied onto the row. | `club.start_checkout` |
 | `pending` | `active` | First payment. The anchor is the moment the payment is applied; period 1 ends one plan period later. | `payment_succeeded` |
 | `active` | `active` | A renewal is paid. The new period starts where the old one ended. | `payment_succeeded` |
-| `active` | `past_due` | A renewal charge was declined; a Stars renewal has not arrived by the period end plus `stars_renewal_wait_minutes`; or a charge is still undecided at its deadline. Grace runs from the period end. | `charge_failed`, `charge_unsettled` |
+| `active` | `past_due` | A renewal charge was declined, or had nothing to charge (a card that was not saved; crypto, which never has a method); a Stars renewal has not arrived by the period end plus `stars_renewal_wait_minutes`; or a charge is still undecided at its deadline. Grace runs from the period end. | `charge_failed`, `charge_unsettled` |
 | `past_due` | `past_due` | A retry was declined. The grace window stays, the next retry is scheduled. | `charge_failed` |
-| `past_due` | `active` | A retry or a payment through the "pay" button went through. | `payment_succeeded` |
+| `past_due` | `active` | A retry or a payment through the "pay" button (for crypto, a new invoice) went through. | `payment_succeeded` |
 | `past_due` | `expired` | Grace is over and no retry is due (reason `payment_failed`), or the member turned auto-renew off, or the payment was refunded (reason `canceled`). | `expire`, `cancel` |
 | `active` | `canceled` | Auto-renew turned off, or a refund in the YooKassa dashboard. Access stays until the period end. | `cancel` |
 | `canceled` | `active` | Auto-renew turned back on before the period end. For Stars only when a renewal charged after the cancel arrives, which means the member re-enabled it in Telegram. | `resume`, `payment_succeeded` |
 | `canceled` | `canceled` | A renewal charge sent before the cancel goes through. It pays the next period, and auto-renew stays off. | `payment_succeeded` |
 | `canceled` | `expired` | The paid period is over (reason `canceled`). Stars subscriptions wait `stars_renewal_wait_minutes` longer. | `expire` |
-| `expired` | `active` | A payment on an expired subscription, from the "pay" button or a new Stars invoice. The anchor moves to the payment. | `payment_succeeded` |
+| `expired` | `active` | A payment on an expired subscription, from the "pay" button or a new Stars or Crypto Pay invoice. The anchor moves to the payment. | `payment_succeeded` |
 | `expired` | `canceled` | A renewal charge sent before a cancel goes through after the subscription expired, while the period it pays for is still running. If that period is already over, the payment is flagged for a refund instead. | `payment_succeeded` |
 
 `active`, `past_due` and `canceled` are live statuses: a member has at most one live subscription (a
@@ -90,7 +93,8 @@ never starts from "now". Month arithmetic clamps to the last day of a shorter mo
 anchored on 31 January, the periods end on 28 February, 31 March, 30 April, 31 May. The anchor moves
 only when access had ended (a first payment, or a payment after expiry); then the new period starts
 at the payment. Stars is the exception: Telegram decides the period end, and
-`subscription_expiration_date` is taken as is.
+`subscription_expiration_date` is taken as is. A crypto period paid early, from the reminder,
+starts at the end of the current one like a renewal does, so paying ahead loses no days.
 
 A monthly YooKassa subscription paid on 31 January 2026 at 09:00 UTC, with the default settings, the
 card declined at every renewal, and scheduler passes on time:
@@ -127,7 +131,7 @@ no migrations.
 | `payments` | Every payment event, applied or not, with its outcome (`applied`, `recorded`, `stale`, `needs_refund`, `amount_mismatch`, `unknown_subscription`) | `(provider, provider_payment_id)` unique; partial unique index on `(subscription_id, for_period)` where `status = succeeded` and `applied` |
 | `refunds` | Refunds made in the YooKassa dashboard | `(provider, refund_id)` unique |
 | `charge_attempts` | One row per renewal charge, written before the provider call: `started`, `pending`, `succeeded`, `failed`, number of calls, last error, next lookup | `idempotence_key` unique; `(subscription_id, for_period, attempt)` unique |
-| `checkouts` | Payments a provider created for a checkout link, looked up until decided | `(provider, provider_payment_id)` unique |
+| `checkouts` | Payments a provider created for a checkout link (a YooKassa payment, a Crypto Pay invoice), looked up until decided | `(provider, provider_payment_id)` unique |
 | `stars_payment_updates` | Each Telegram Stars `successful_payment` as it arrived, stored before it is applied | `telegram_payment_charge_id` unique |
 | `notifications` | The outbox: rendered text, buttons, status, attempts, `not_after`, lease columns | `key` unique |
 | `access_events` | Every join decision and removal attempt: approved, declined, failed, removed, removed on join, not a participant, skipped admin, skipped (has access), no rights, error | — |
@@ -145,6 +149,10 @@ passes on one database at the same time; how they split the work is under
    - A Stars subscription is not charged: Telegram charges it. Its `next_charge_at` is the period
      end plus `stars_renewal_wait_minutes`, and if the renewal has not arrived by then, it goes
      `past_due` without retries and the member is told.
+   - A Crypto Pay subscription has nothing to charge. It goes through the steps below, but the
+     provider answers `no_saved_payment_method` at once, without a request, so it goes
+     `past_due` with grace, and each retry date only sends the member the pay button again.
+     Members who pay ahead, from the reminder, never reach this step for that period.
    - Otherwise, in one transaction, the `charge_attempts` row for
      `paidclub-<subscription>-<period>-<attempt>` is created (or found) and its call count raised,
      and that is committed. A row already `pending` is left to step 2. A row whose earlier calls
@@ -163,7 +171,9 @@ passes on one database at the same time; how they split the work is under
 3. **Checkouts.** Checkout payments whose notification has not arrived are looked up 5 minutes after
    the link was made, every 15 minutes for two hours, then hourly, and given up after 48 hours
    ([`checkouts.py`](../src/paidclub/checkouts.py)). If a lookup applies a successful payment, the
-   owner is told to check the notification URL.
+   owner is told to check the notification URL. A Crypto Pay invoice expires unpaid after
+   `PAIDCLUB_CRYPTOPAY_INVOICE_LIFETIME_MINUTES` (at most a day), and the lookup that sees it
+   `expired` records a failed checkout.
 4. **Stars updates.** `stars_payment_updates` rows still `pending` are applied again, with waits
    doubling from 1 minute to an hour, 12 times; then the row is `failed` and the owner is alerted.
 5. **Expiry.** `past_due` subscriptions whose grace is over and that have no retry due, and
@@ -224,10 +234,11 @@ The loop sleeps one second when there is nothing to send.
 
 | What | Key | Enforced by | A repeat |
 | --- | --- | --- | --- |
-| A provider payment | `(provider, provider_payment_id)`: the YooKassa payment id, the Telegram charge id, the fake payment id | unique constraint on `payments` | answered as `duplicate`, nothing written. One exception: a payment recorded as failed that later reports success is upgraded, because money moved |
+| A provider payment | `(provider, provider_payment_id)`: the YooKassa payment id, the Crypto Pay invoice id, the Telegram charge id, the fake payment id | unique constraint on `payments` | answered as `duplicate`, nothing written. One exception: a payment recorded as failed that later reports success is upgraded, because money moved |
 | A paid period | `(subscription_id, for_period)` | partial unique index on applied successful `payments` | a second payment for a paid period is recorded as `needs_refund`, and the owner is alerted |
 | A renewal charge | `paidclub-<subscription>-<period>-<attempt>`, attempt 0 for the regular renewal, 1 and 2 for retries | unique `charge_attempts.idempotence_key`; sent as YooKassa's `Idempotence-Key` header | YooKassa returns the first answer for 24 hours; after 23 hours the app searches `GET /v3/payments` for its metadata instead of sending again |
 | A checkout payment | a random UUID per checkout as `Idempotence-Key`; then `(provider, provider_payment_id)` | unique constraint on `checkouts` | the same key is reused once after a 5xx or a timeout; tapping "pay" twice makes two payment pages, and the second payment for the period is caught by the paid-period key |
+| A crypto period | the period in the invoice payload `paidclub:<subscription>:<period>` | paid-period key | a second invoice paid for the same period (the member tapped "pay" twice) is `needs_refund`, and the owner sends the coins back from @CryptoBot |
 | A Stars update | `telegram_payment_charge_id` | unique `stars_payment_updates.telegram_payment_charge_id` | stored once, applied once |
 | A Stars first payment | the period in the invoice payload `paidclub:<subscription>:<period>` | paid-period key | a second Telegram subscription bought from the same invoice is `needs_refund`, and it is cancelled with `editUserStarSubscription` |
 | A refund | `(provider, refund_id)` | unique constraint on `refunds` | answered as `duplicate` |
@@ -289,6 +300,7 @@ Tests that run these races: `tests/test_db.py::test_two_concurrent_claims_never_
 | while a Stars `successful_payment` is being applied | the update is already in `stars_payment_updates`; the scheduler applies it |
 | with the database down when a Stars payment arrives | storing is tried 4 times; then the owner gets a direct Telegram message with the charge id, outside the outbox, and the payment is logged at CRITICAL |
 | before a YooKassa checkout notification was handled | YooKassa sends it again for 24 hours, and the scheduler looks the payment up anyway |
+| before a Crypto Pay webhook was handled | the scheduler looks the invoice up with `getInvoices` |
 
 ## Stats
 
@@ -298,6 +310,7 @@ cancellations, churn, failed charges, revenue) comes from `subscription_events` 
 bucketed by calendar day or month in `PAIDCLUB_DISPLAY_TIMEZONE`. Buckets are filled in Python
 rather than with SQL date functions, because SQLite has no time zone support, and so the daily rows
 add up to the totals exactly. MRR counts `active` and `past_due` subscriptions, each price divided
-by its length in months (30 days count as one month); rubles and Stars are never added together.
+by its length in months (30 days count as one month); rubles, Stars and dollars are never added
+together.
 Revenue is gross: refunds are recorded, not subtracted. Churn rate is the number of subscriptions
 that expired in the window divided by the number that had access at some point in it.

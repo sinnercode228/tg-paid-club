@@ -5,10 +5,12 @@ English · [Русский](README.ru.md)
 [![CI](https://github.com/sinnercode228/tg-paid-club/actions/workflows/ci.yml/badge.svg)](https://github.com/sinnercode228/tg-paid-club/actions/workflows/ci.yml)
 
 A Telegram bot that sells access to a private channel or group by subscription. Members pay by
-card through YooKassa or with Telegram Stars. The bot lets them in through join requests,
-charges renewals with the saved card (YooKassa) or applies the renewals Telegram makes (Stars),
-reminds members before a renewal or the end of access, retries failed charges during a grace
-period and removes members whose access has ended. The owner gets `/stats` and `/export` in the
+card through YooKassa, with Telegram Stars, or in USDT, TON and other coins through Crypto Pay
+(@CryptoBot). The bot lets them in through join requests and charges renewals with the saved
+card (YooKassa) or applies the renewals Telegram makes (Stars). Crypto cannot be charged, so a
+crypto member pays every period with a new invoice. The bot reminds members before a renewal
+or the end of access, retries failed charges during a grace period and removes members whose
+access has ended. The owner gets `/stats` and `/export` in the
 bot and a dashboard at `/admin`. It is one Python process: aiogram 3, FastAPI and SQLAlchemy 2
 async on SQLite or PostgreSQL.
 
@@ -83,8 +85,8 @@ the same key gets YooKassa's first answer back. YooKassa remembers a key for 24 
 
 ## How a membership goes, end to end
 
-With YooKassa, from setting up the chat to removal. Where Telegram Stars or the fake provider
-differ, it says so.
+With YooKassa, from setting up the chat to removal. Where Telegram Stars, Crypto Pay or the
+fake provider differ, it says so.
 
 1. **The chat.** The owner adds the bot to a private channel or supergroup as an administrator
    who can invite users, and, in a supergroup, ban users. On startup, and whenever its own
@@ -103,6 +105,10 @@ differ, it says so.
      The member gets `confirmation_url` as a button. The payment id goes into `checkouts`.
    - Stars: `createInvoiceLink(currency="XTR", prices=[one price],
      subscription_period=2592000, payload="paidclub:<subscription>:<period>")`.
+   - Crypto Pay: `createInvoice` with `currency_type: "fiat"`, `fiat: "USD"`, `amount: "10.00"`,
+     `accepted_assets: "USDT,TON"`, `payload: "paidclub:<subscription>:<period>"` and
+     `expires_in`. The member gets `bot_invoice_url`, which opens the invoice in @CryptoBot,
+     and pays in a coin at @CryptoBot's rate. The invoice id goes into `checkouts`.
    - Fake: a signed link to `/fake-checkout/<token>` on this app, a page where you choose
      whether the payment goes through and whether the card is saved for renewals.
 
@@ -122,6 +128,12 @@ differ, it says so.
      `stars_payment_updates` before it is applied, because Telegram delivers it only once.
      `subscription_expiration_date` sets the period end, and the first
      `telegram_payment_charge_id` is kept for cancelling later.
+   - Crypto Pay: posts `invoice_paid` to `/webhooks/cryptopay`. The `crypto-pay-api-signature`
+     header must be the HMAC-SHA-256 of the raw body, keyed with SHA-256 of the API token, or
+     the request gets 400 before anything else. Even then only the invoice id is taken from the
+     body: the invoice is fetched with `getInvoices` and its status there is applied. A lost
+     webhook is caught by the same lookups as above, and an invoice that expired unpaid is
+     recorded as a failed checkout. Code: [`billing/cryptopay.py`](src/paidclub/billing/cryptopay.py).
 4. **Activation.** One transaction records the payment, moves the subscription from `pending`
    to `active` with the first period starting now, and puts "Оплата прошла" with the "Вступить
    в клуб" button into the outbox. The outbox sends it with `sendMessage`. Code:
@@ -137,9 +149,10 @@ differ, it says so.
    [`bot/join.py`](src/paidclub/bot/join.py).
 6. **Reminders.** 3 days and 1 day before the period ends. The text depends on the case: auto
    renewal with a saved card (with a button to turn it off), no saved card (with a pay
-   button), a Stars subscription (check your Stars balance), or auto-renew already off (with a
-   button to turn it back on). A worker that was down during the 3-day window sends only the
-   1-day reminder.
+   button), a Stars subscription (check your Stars balance), a crypto subscription (pay the
+   next period now: it starts where this one ends, so no day is lost), or auto-renew already
+   off (with a button to turn it back on). A worker that was down during the 3-day window sends
+   only the 1-day reminder.
 7. **Renewal.** At the period end the scheduler claims the subscription. It commits a
    `charge_attempts` row and then sends `POST /v3/payments` with `payment_method_id`,
    `capture: true` and `Idempotence-Key: paidclub-<subscription>-<period>-<attempt>`. A
@@ -149,13 +162,18 @@ differ, it says so.
    - Stars: Telegram charges the renewal itself and sends `successful_payment` with
      `is_recurring`. If none has arrived 60 minutes after the period end, the subscription
      goes `past_due` without retries, since there is nothing for the bot to charge.
+   - Crypto Pay: nothing can be charged. The provider answers the renewal with
+     `no_saved_payment_method` without a request, the subscription goes `past_due`, and the
+     member gets "Оплаченный период закончился, а следующий не оплачен" with the pay button. A
+     new invoice paid during grace still starts the period at the old period end.
 8. **A failed charge.** The subscription goes `past_due` and access stays until the end of
    the grace period. Retries run at +1 and +3 days with attempt numbers 1 and 2, each with
    its own key. The member gets "Не получилось списать …" with a "pay" button, which opens a
    checkout for the same period. If both the retry and the button payment go through, the
    period is extended once, and the second payment is flagged for the owner to refund.
    YooKassa answers 4xx other than 429 are final refusals. 401 and 403 also alert the owner,
-   because only the owner can fix the shop's credentials or the shop's permissions. Code:
+   because only the owner can fix the shop's credentials or the shop's permissions. For crypto
+   the retries charge nothing: each one only sends the pay button again. Code:
    [`scheduler.py`](src/paidclub/scheduler.py).
 9. **Expiry and removal.** When grace ends with nothing paid, the subscription becomes
    `expired` and the member gets "доступ к клубу закрыт" with a button to choose a plan. In
@@ -175,25 +193,25 @@ The state machine, the tables, one scheduler pass and every idempotency key are 
 
 ## Providers
 
-| | YooKassa | Telegram Stars | Fake (demo) |
-| --- | --- | --- | --- |
-| Currency | RUB, from `price_rub` | XTR, from `price_stars` | RUB, from `price_rub` |
-| Plans | Any period | 30 days only: `subscription_period` must be 2592000, so only 1-month and 30-day plans can have `price_stars` | Any period |
-| Price limit | none in this code | at most 10000 Stars per period (Bot API) | none |
-| First payment | YooKassa's page (`confirmation.type = redirect`), card saved with `save_payment_method: true` | Invoice link opened in Telegram | Local page `/fake-checkout/<token>` with four outcomes |
-| Renewals | Charged by the app: `payment_method_id` plus `Idempotence-Key` | Charged by Telegram, arrive as `successful_payment` with `is_recurring` | Charged by the app against a "saved card" that either always pays or always declines |
-| How a payment is confirmed | Body not trusted: `GET /v3/payments/{id}` with the shop credentials | Bot updates from Telegram, `pre_checkout_query` checked first | HMAC-SHA256 signature in `X-Fake-Signature` |
-| Missed or failed notification | Payment looked up by id for up to 48 hours | The update is stored before it is applied, and the scheduler retries one that failed to apply. Stars payments are not looked up | The page sends its own notification |
-| Failed renewal | Retried 1 and 3 days after the first failure | Telegram sends nothing. A renewal missing 60 minutes after the period end counts as failed | Retried like YooKassa |
-| Cancel | Our side only: there is no subscription at YooKassa | `editUserStarSubscription(is_canceled=True)` | Our side only |
-| Refunds | Made by the owner in the YooKassa dashboard. `refund.succeeded` is confirmed with `GET /v3/refunds/{id}`, then auto-renew is turned off and the card forgotten | Not made by the app (`refundStarPayment` is not called). The owner is alerted when a payment needs one | None |
-| What the shop needs | Shop id and secret key. **Autopayments work by default only in a test shop; a live shop needs a YooKassa manager to enable them.** Notifications go only to HTTPS on port 443 or 8443 | Nothing: Stars go to the bot's balance | Nothing. No money moves, and anyone with a link can "pay" |
+| | YooKassa | Telegram Stars | Crypto Pay | Fake (demo) |
+| --- | --- | --- | --- | --- |
+| Currency | RUB, from `price_rub` | XTR, from `price_stars` | USD, from `price_usd`, paid in the coins of `PAIDCLUB_CRYPTOPAY_ASSETS` (USDT and TON by default) at @CryptoBot's rate | RUB, from `price_rub` |
+| Plans | Any period | 30 days only: `subscription_period` must be 2592000, so only 1-month and 30-day plans can have `price_stars` | Any period | Any period |
+| Price limit | none in this code | at most 10000 Stars per period (Bot API) | none in this code | none |
+| First payment | YooKassa's page (`confirmation.type = redirect`), card saved with `save_payment_method: true` | Invoice link opened in Telegram | `createInvoice` in dollars, opened in @CryptoBot through `bot_invoice_url` | Local page `/fake-checkout/<token>` with four outcomes |
+| Renewals | Charged by the app: `payment_method_id` plus `Idempotence-Key` | Charged by Telegram, arrive as `successful_payment` with `is_recurring` | **None.** Crypto cannot be charged: every period is a new invoice the member pays, from the reminder or the pay button | Charged by the app against a "saved card" that either always pays or always declines |
+| How a payment is confirmed | Body not trusted: `GET /v3/payments/{id}` with the shop credentials | Bot updates from Telegram, `pre_checkout_query` checked first | HMAC-SHA-256 in `crypto-pay-api-signature` checked first, then the body is not trusted either: `getInvoices` with the app token | HMAC-SHA256 signature in `X-Fake-Signature` |
+| Missed or failed notification | Payment looked up by id for up to 48 hours | The update is stored before it is applied, and the scheduler retries one that failed to apply. Stars payments are not looked up | Invoice looked up by id until it is paid or expires (`PAIDCLUB_CRYPTOPAY_INVOICE_LIFETIME_MINUTES`) | The page sends its own notification |
+| Failed renewal | Retried 1 and 3 days after the first failure | Telegram sends nothing. A renewal missing 60 minutes after the period end counts as failed | Nothing to fail: the period end goes `past_due` with the grace period, and the pay button is sent again on the retry days | Retried like YooKassa |
+| Cancel | Our side only: there is no subscription at YooKassa | `editUserStarSubscription(is_canceled=True)` | Nothing to cancel: a member who stops paying loses access after grace | Our side only |
+| Refunds | Made by the owner in the YooKassa dashboard. `refund.succeeded` is confirmed with `GET /v3/refunds/{id}`, then auto-renew is turned off and the card forgotten | Not made by the app (`refundStarPayment` is not called). The owner is alerted when a payment needs one | Not made by the app. The owner is alerted when a payment needs one and sends the coins back from @CryptoBot | None |
+| What the shop needs | Shop id and secret key. **Autopayments work by default only in a test shop; a live shop needs a YooKassa manager to enable them.** Notifications go only to HTTPS on port 443 or 8443 | Nothing: Stars go to the bot's balance | A Crypto Pay app token from @CryptoBot (@CryptoTestnetBot for the testnet), and webhooks turned on in the app with `/webhooks/cryptopay` on a public HTTPS address. Payments land in the app's balance in @CryptoBot | Nothing. No money moves, and anyone with a link can "pay" |
 
 The fake provider is refused when `PAIDCLUB_ENV=prod`. `paidclub run` and `paidclub web` also
 refuse it next to a real provider, or with club chats on a public `PAIDCLUB_PUBLIC_BASE_URL`,
 unless `PAIDCLUB_DEMO=1` says it is a demo on purpose.
 
-All three implement one protocol in [`billing/base.py`](src/paidclub/billing/base.py): start a
+All four implement one protocol in [`billing/base.py`](src/paidclub/billing/base.py): start a
 checkout, charge a renewal, look a payment up, parse and verify a webhook, cancel, resume.
 None of them touches the database. Everything they report goes through
 `apply_payment_event` in [`payments.py`](src/paidclub/payments.py), which is the one place
@@ -202,6 +220,19 @@ where money changes a subscription.
 Prodamus is not included. I could not confirm from Prodamus's official documentation or its
 official libraries how its notifications are signed, and this code does not apply a payment
 notification it cannot verify.
+
+**Next step: USDT straight to the owner's TON wallet.** With Crypto Pay the money sits in the
+app's balance in @CryptoBot until the owner withdraws it. A `ton` provider without anyone in
+between is designed but not built. Its checkout would be a
+`ton://transfer/<wallet>?jetton=<USDT master>&amount=<units>&text=<comment>` link (and the
+same as a Tonkeeper link) with a comment unique to the checkout. A scheduler step would poll
+toncenter API v3 for jetton transfers into the wallet every pass, match the comment, check that
+the jetton master is the official USDT one, apply the transfer when it covers the price
+(less does not activate, more is accepted and logged), and use the transaction hash as the
+payment id, so a transfer is applied once. Native TON would need a TON price per plan rather
+than a live rate. It is not here yet because it needs that lookup step every 30 seconds
+rather than the checkout lookups' 5 and 15 minutes, matching of toncenter's raw addresses
+against user-friendly ones, and toncenter answers I could not check against live responses.
 
 ## Quick start
 
@@ -289,7 +320,7 @@ PAIDCLUB_DUNNING_RETRY_DAYS=0.25,0.5
 On the payment page, "Оплатить картой, которая откажет при продлении" gives a card whose
 renewals are always declined.
 
-### With YooKassa or Stars
+### With YooKassa, Stars or Crypto Pay
 
 - YooKassa: set `PAIDCLUB_YOOKASSA_SHOP_ID`, `PAIDCLUB_YOOKASSA_SECRET_KEY` and
   `PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN`, put `yookassa` in `PAIDCLUB_PROVIDERS` and the public
@@ -299,8 +330,16 @@ renewals are always declined.
   autopayments on. A live shop gets them only after a YooKassa manager enables them.
 - Stars: put `stars` in `PAIDCLUB_PROVIDERS`. The default monthly plan has `price_stars: 500`.
   No credentials are needed.
+- Crypto Pay: in @CryptoBot open Crypto Pay, create an app and put its API token in
+  `PAIDCLUB_CRYPTOPAY_API_TOKEN`, then put `cryptopay` in `PAIDCLUB_PROVIDERS`. In the app's
+  settings, turn webhooks on with `{PAIDCLUB_PUBLIC_BASE_URL}/webhooks/cryptopay`
+  (`paidclub check` prints this URL). The default plans have `price_usd`, and invoices take
+  USDT and TON (`PAIDCLUB_CRYPTOPAY_ASSETS`). To try it without real money, create the app in
+  @CryptoTestnetBot instead, set `PAIDCLUB_CRYPTOPAY_API_URL=https://testnet-pay.crypt.bot/api`
+  and pay with testnet coins. Without a public HTTPS address the webhook does not reach a
+  local bot, and a paid invoice is applied by the lookup 5 minutes after the checkout.
 
-`PAIDCLUB_PROVIDERS=yookassa,stars` offers both, in that order.
+`PAIDCLUB_PROVIDERS=yookassa,stars,cryptopay` offers all three, in that order.
 
 ## Configuration
 
@@ -358,7 +397,7 @@ problem.
 ## Docker
 
 ```sh
-cp .env.example .env   # bot token, owner, club chats, admin token, yookassa and/or stars
+cp .env.example .env   # bot token, owner, club chats, admin token, yookassa, stars, cryptopay
 docker compose up --build
 ```
 
@@ -368,7 +407,8 @@ Compose starts PostgreSQL 17 and the app, and passes the app
 prod" while `.env` still has `PAIDCLUB_PROVIDERS=fake`. That value is left in `.env.example`
 on purpose, so the local demo works as is. For a demo in Docker, set `PAIDCLUB_ENV=dev` in
 `.env`. The web app is published on `127.0.0.1:8000` only. Put an HTTPS reverse proxy in front
-of it for YooKassa notifications, the Telegram webhook mode and the `/admin` login.
+of it for YooKassa and Crypto Pay notifications, the Telegram webhook mode and the `/admin`
+login.
 
 Tables are created on start (`create_all`), so there is nothing to migrate on a fresh database.
 `make up` and `make down` wrap the compose commands. CI builds the image and checks that it
@@ -382,7 +422,7 @@ make lint            # ruff check, ruff format --check, mypy --strict
 make test-postgres   # the same tests on PostgreSQL; every table in PG_TEST_URL is dropped
 ```
 
-506 tests, about 20 seconds on SQLite, 93% line and branch coverage. Each test gets its own
+574 tests, about 20 seconds on SQLite, 94% line and branch coverage. Each test gets its own
 SQLite file. With `PAIDCLUB_TEST_DATABASE_URL` pointing at a PostgreSQL database whose name
 contains `test`, the database tests run there instead, so `SELECT … FOR UPDATE SKIP LOCKED`
 and `ON CONFLICT` run on the real thing. The default URL of `make test-postgres` is
@@ -396,11 +436,12 @@ build. [`tests/test_docs.py`](tests/test_docs.py) fails when the configuration t
 READMEs miss a setting or show a wrong default, or when a link or a test named in the docs does not
 exist.
 
-Nothing in the tests talks to Telegram or YooKassa. [`tests/botapi.py`](tests/botapi.py) is a
-Bot API session that answers from memory. Its results and errors go through aiogram's own
-response parsing, so handlers see the same objects and exceptions as in production, including
-`TelegramRetryAfter`. The YooKassa tests run against an in-memory API behind
-`httpx.MockTransport`, built from YooKassa's documentation.
+Nothing in the tests talks to Telegram, YooKassa or Crypto Pay.
+[`tests/botapi.py`](tests/botapi.py) is a Bot API session that answers from memory. Its results
+and errors go through aiogram's own response parsing, so handlers see the same objects and
+exceptions as in production, including `TelegramRetryAfter`. The YooKassa tests run against an
+in-memory API behind `httpx.MockTransport`, built from YooKassa's documentation, and the Crypto
+Pay tests against an in-memory Crypto Pay that signs its webhooks the way Crypto Pay does.
 
 Tests worth reading before the code:
 
@@ -409,6 +450,8 @@ Tests worth reading before the code:
 - `tests/test_payments.py::test_the_same_webhook_delivered_concurrently_is_applied_once`.
 - `tests/test_billing_yookassa.py::test_the_webhook_body_is_not_trusted` and
   `test_a_renewal_whose_answer_was_lost_is_looked_up_once_the_key_may_be_forgotten`.
+- `tests/test_billing_cryptopay.py::test_webhooks_without_a_valid_signature_are_rejected_before_any_request`
+  and `test_after_the_period_end_a_new_invoice_paid_during_grace_renews_from_the_old_end`.
 - `tests/test_cancel_during_renewal.py`: a renewal charge approved after the member cancelled.
 - `tests/test_bot_revoker.py::test_a_removal_whose_unban_was_lost_is_finished_on_retry`.
 - `tests/test_outbox.py::test_two_senders_running_together_send_each_message_once`.
@@ -443,6 +486,17 @@ Things this code does not do, or that need care before a real club runs on it.
 - **Stars.** Monthly only. A failed renewal produces no update, so it is noticed 60 minutes
   after the period end. Stars refunds are left to the owner. Turning renewal back on needs the
   member to do it in Telegram.
+- **Crypto has no automatic renewal.** Crypto Pay cannot charge a member, so a crypto
+  subscription continues only when the member pays a new invoice: from the reminder before the
+  period end, or from the pay button during the grace period. A member who does not pay loses
+  access when grace ends, like after a declined card. In the stats, each of those dunning steps
+  is a renewal with nothing to charge, not a failed charge.
+- **Crypto prices are in dollars.** An invoice is for the plan's `price_usd`, and @CryptoBot
+  converts it to the coin at its own rate when the member pays. Revenue is recorded in
+  dollars, before Crypto Pay's fee. Refunds are sent by hand from @CryptoBot. Crypto Pay
+  webhooks need a public HTTPS address; without one, a paid invoice waits for the lookup, 5
+  minutes after the checkout and then every 15 minutes.
+- **No payments straight to a TON wallet** yet, see [Providers](#providers).
 - **Refunds and revenue.** A refund made in the YooKassa dashboard turns auto-renew off and
   forgets the card, and access lasts to the period end. Revenue on the dashboard is gross:
   refunds are recorded but not subtracted.
@@ -456,7 +510,8 @@ Things this code does not do, or that need care before a real club runs on it.
   output come from the fake provider on a fake clock.
 
 Before going live: set `PAIDCLUB_ENV=prod` (the Docker image already does), put HTTPS in
-front, take `fake` out of `PAIDCLUB_PROVIDERS`, set `PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN`, and run
+front, take `fake` out of `PAIDCLUB_PROVIDERS`, set `PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN`, use a
+mainnet Crypto Pay token with the default `PAIDCLUB_CRYPTOPAY_API_URL`, and run
 `paidclub check`.
 
 ## Where is what
@@ -469,14 +524,14 @@ src/paidclub/
   notifications.py         outbox: enqueue in the same transaction, send once with a lease
   access.py                join-request decisions, removal of expired members
   checkouts.py             looking up checkouts whose notification did not arrive
-  billing/                 provider protocol, YooKassa, Telegram Stars, fake provider
+  billing/                 provider protocol, YooKassa, Telegram Stars, Crypto Pay, fake provider
   bot/                     aiogram routers: member menu, join requests, chats, owner commands
   web/                     FastAPI: webhooks, fake checkout page, /admin, /paid, Telegram webhook
   stats.py                 every number on /stats and /admin, CSV export
   simulate.py              paidclub simulate
   runner.py, cli.py        one process: bot, web, scheduler, outbox; the paidclub command
   models.py, db.py         tables, constraints, claims and transaction retries
-tests/                     pytest, with a fake Bot API session and a mocked YooKassa API
+tests/                     pytest, with a fake Bot API session and mocked YooKassa and Crypto Pay
 docs/architecture.md       state machine, tables, scheduler pass, idempotency keys
 ```
 
