@@ -21,7 +21,7 @@ from aiogram.methods import (
 )
 from aiogram.methods.base import TelegramType
 from aiogram.types import LabeledPrice, SuccessfulPayment, Update, User
-from aiogram_stars import PaymentStatus, StarsPayments
+from aiogram_stars import PaymentStatus, RefundStatus, StarsPayments
 from aiogram_stars.sqlalchemy import SqlAlchemyStorage
 from pydantic import SecretStr
 from sqlalchemy import event, select
@@ -710,6 +710,38 @@ async def test_a_paid_invoice_this_bot_did_not_sign_is_refunded_and_not_applied(
     await payments_lib.send_due_refunds(bot)
     [refund] = session.of(RefundStarPayment)
     assert (refund.user_id, refund.telegram_payment_charge_id) == (MEMBER, "ch_forged")
+
+
+async def test_a_refund_that_runs_out_of_attempts_reaches_the_owner(
+    core: Core,
+    session: RecordingSession,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    clock: FakeClock,
+    payments_lib: StarsPayments,
+) -> None:
+    """aiogram-stars gives a refund up after 8 attempts, about an hour; the Stars are still
+    the member's, so the owner has to hear about it, not only the logs."""
+    sub_id, _ = await stars_invoice(core, session)
+    forged = f"{sub_id}:1.AAAAAAAAAAAAAAAAAAAAAA"
+    for _ in range(8):
+        session.fail("refundStarPayment", (400, "Bad Request: CHARGE_NOT_FOUND"))
+    await dispatcher.feed_update(
+        bot, payment_update(forged, charge_id="ch_forged", expires=START + THIRTY_DAYS, first=True)
+    )
+
+    for _ in range(7):
+        await payments_lib.send_due_refunds(bot)
+        clock.advance(timedelta(hours=1))
+    assert await notifications(core, "owner_alert") == []
+    await payments_lib.send_due_refunds(bot)
+
+    assert len(session.of(RefundStarPayment)) == 8
+    refund = await payments_lib.get_refund("ch_forged")
+    assert refund is not None and refund.status is RefundStatus.FAILED
+    [alert] = await notifications(core, "owner_alert")
+    assert "ch_forged" in alert.text and str(MEMBER) in alert.text
+    assert "CHARGE_NOT_FOUND" in alert.text
 
 
 async def test_a_signed_invoice_for_something_other_than_a_club_period_is_refunded(

@@ -54,6 +54,7 @@ from aiogram.types import ErrorEvent, Message, PreCheckoutQuery, SuccessfulPayme
 from aiogram_stars import SUBSCRIPTION_PERIOD, RejectPayment, StarsPayments
 from aiogram_stars import Checkout as StarsCheckout
 from aiogram_stars import Payment as StarsPayment
+from aiogram_stars import Refund as StarsRefund
 from aiogram_stars.sqlalchemy import SqlAlchemyStorage
 from aiogram_stars.sqlalchemy import metadata as stars_metadata
 from sqlalchemy import select, update
@@ -353,6 +354,7 @@ def stars_payments(
     ``secret`` signs the payloads (``PAIDCLUB_STARS_PAYLOAD_SECRET``). A check that cannot
     finish in ``pre_checkout_timeout`` seconds (database down or slow) declines the payment
     with :data:`ERROR_UNAVAILABLE`: declining moves no money and the member can try again.
+    A refund that aiogram-stars gives up on (8 attempts, about an hour) is an owner alert.
     """
 
     async def check(checkout: StarsCheckout) -> None:
@@ -372,11 +374,26 @@ def stars_payments(
             raise RejectPayment(ERROR_INVALID)
         await _on_payment(core, message, user_id=payment.user_id, sleep=sleep)
 
+    async def on_refund_failed(refund: StarsRefund) -> None:
+        async with core.sessions() as session, session.begin():
+            await alert_owner(
+                session,
+                core,
+                # Per failure: a refund queued again by hand can fail again.
+                key=f"owner:stars_refund_failed:{refund.charge_id}:"
+                f"{int(refund.updated_at.timestamp())}",
+                text=f"Возврат Telegram Stars за платёж {refund.charge_id} пользователю "
+                f"{refund.user_id} не прошёл после {refund.attempts} попыток "
+                f"({(refund.last_error or 'без ошибки')[:200]}). Stars не вернулись: "
+                "верните их вручную.",
+            )
+
     return StarsPayments(
         RetryingStarsStorage(core.engine, sleep=sleep),
         secret=secret,
         on_paid=on_paid,
         check=check,
+        on_refund_failed=on_refund_failed,
         checkout_timeout=pre_checkout_timeout,
         checkout_error=ERROR_UNAVAILABLE,
         clock=core.clock.now,

@@ -247,7 +247,7 @@ The message keys:
 | `payment_failed:<sub>:<period>:<attempt>` | renewal failed, pay button; dropped after `grace_until` |
 | `expired:<sub>:<periods paid>` | access ended |
 | `refunded:<provider>:<refund id>` | money returned, auto-renew off |
-| `owner:…` | alerts to the owner: an unknown subscription, a wrong amount or a payment to refund (per payment), a charge without an answer or given up (per charge key), a Stars payment that never applied (per charge id), missing rights, chat setup problems, people who joined without access, a provider refusal for the shop's own reasons, a lost notification (once a day each), a join request Telegram never took (once an hour) |
+| `owner:…` | alerts to the owner: an unknown subscription, a wrong amount or a payment to refund (per payment), a charge without an answer or given up (per charge key), a Stars payment that never applied (per charge id), a Stars refund that ran out of attempts (per failure), missing rights, chat setup problems, people who joined without access, a provider refusal for the shop's own reasons, a lost notification (once a day each), a join request Telegram never took (once an hour) |
 
 ## Concurrency
 
