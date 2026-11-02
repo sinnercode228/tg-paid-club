@@ -44,7 +44,9 @@ LIVE_STATUSES: tuple[SubStatus, ...] = (SubStatus.ACTIVE, SubStatus.PAST_DUE, Su
 
 
 class RenewalMode(StrEnum):
-    #: We charge a saved payment method ourselves (YooKassa, the fake provider).
+    #: We charge a saved payment method ourselves (YooKassa, the fake provider). Without one
+    #: (a card that was not saved, or crypto, which never has one) the renewal fails into
+    #: dunning and the member pays with the "pay" button.
     MERCHANT = "merchant"
     #: The provider charges on its own schedule and tells us afterwards (Telegram Stars).
     PROVIDER = "provider"

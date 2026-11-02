@@ -19,7 +19,8 @@ from paidclub.money import Money
 
 class PaymentPurpose(StrEnum):
     #: The member paid through a checkout page or invoice: first payment, or the "pay" button
-    #: after a failed renewal. Failures here do not count as dunning attempts.
+    #: after a failed renewal or ahead of one (with crypto, every period is paid this way).
+    #: Failures here do not count as dunning attempts.
     CHECKOUT = "checkout"
     #: A renewal: merchant-initiated charge of a saved method, or a Stars auto-renewal.
     RENEWAL = "renewal"
@@ -154,12 +155,15 @@ class ProviderError(Exception):
 
 @runtime_checkable
 class BillingProvider(Protocol):
-    #: Stored on subscriptions and payments: ``"fake"``, ``"yookassa"``, ``"stars"``.
+    #: Stored on subscriptions and payments: ``"fake"``, ``"yookassa"``, ``"stars"``,
+    #: ``"cryptopay"``.
     name: str
-    #: ``"RUB"`` or ``"XTR"``; picks the plan price.
+    #: ``"RUB"``, ``"XTR"`` or ``"USD"``; picks the plan price.
     currency: str
     #: ``True`` when we charge renewals ourselves (``charge_renewal``), ``False`` when the
-    #: provider renews on its own and reports the payment (Telegram Stars).
+    #: provider renews on its own and reports the payment (Telegram Stars). A provider with
+    #: nothing it could charge (Crypto Pay) is ``True`` and answers every renewal with
+    #: ``no_saved_payment_method``, so the member pays each period through a checkout.
     supports_merchant_renewal: bool
 
     async def start_checkout(self, request: CheckoutRequest) -> Checkout:

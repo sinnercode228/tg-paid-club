@@ -77,9 +77,12 @@ def parse_days(args: str | None) -> int | None:
 
 
 def _amounts(values: dict[str, Money], fallback: str = "RUB") -> str:
-    """``"5 460 ₽ и 500 ⭐"``: rubles and stars side by side, never added up."""
+    """``"5 460 ₽, 500 ⭐ и 120 $"``: each currency side by side, never added up."""
     shown = [money.human() for money in values.values()]
-    return " и ".join(shown) if shown else Money(0, fallback).human()
+    if not shown:
+        return Money(0, fallback).human()
+    *rest, last = shown
+    return f"{', '.join(rest)} и {last}" if rest else last
 
 
 def _percent(rate: Decimal) -> str:
@@ -89,7 +92,7 @@ def _percent(rate: Decimal) -> str:
 
 def _plan_currency(plans: list[PlanConfig], code: str) -> str:
     plan = next((plan for plan in plans if plan.code == code), None)
-    return "XTR" if plan is not None and plan.price_rub is None else "RUB"
+    return plan.currencies[0] if plan is not None else "RUB"
 
 
 def format_stats(report: Report, *, plans: list[PlanConfig]) -> str:
@@ -123,8 +126,8 @@ def format_stats(report: Report, *, plans: list[PlanConfig]) -> str:
     ]
     if totals.renewals_not_charged:
         lines.append(
-            f"Продления, которые нечем было списать (нет карты, способ оплаты выключен): "
-            f"{totals.renewals_not_charged}"
+            "Продления, которые нечем было списать (нет карты, оплата криптовалютой, способ "
+            f"оплаты выключен): {totals.renewals_not_charged}"
         )
     lines += [
         f"Продление не прошло: {totals.dunning_started}, "
@@ -178,7 +181,7 @@ def create_admin_router(core: Core) -> Router:
             subscriptions = await export_subscriptions(session, core.tz)
             payments = await export_payments(session, core.tz)
         stamp = core.clock.now().astimezone(core.tz).strftime("%Y%m%d-%H%M")
-        note = f"Время — {core.tz}, суммы — в рублях или Stars (колонка currency)."
+        note = f"Время — {core.tz}, суммы — в рублях, Stars или долларах (колонка currency)."
         await message.answer_document(
             BufferedInputFile(subscriptions, filename=f"subscriptions-{stamp}.csv"),
             caption=f"Подписки. {note}",

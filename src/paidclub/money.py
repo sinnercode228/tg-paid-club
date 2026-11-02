@@ -1,8 +1,8 @@
 """Money as integer minor units plus an ISO currency code.
 
-Amounts never touch floats. ``RUB`` has two decimal places (kopecks), ``XTR`` (Telegram Stars)
-has none. Providers that want decimal strings (YooKassa: ``"990.00"``) use
-:meth:`Money.to_decimal_str`.
+Amounts never touch floats. ``RUB`` has two decimal places (kopecks), ``USD`` too (cents; crypto
+invoices are priced in dollars), ``XTR`` (Telegram Stars) has none. Providers that want decimal
+strings (YooKassa: ``"990.00"``, Crypto Pay: ``"10.00"``) use :meth:`Money.to_decimal_str`.
 """
 
 from __future__ import annotations
@@ -11,9 +11,9 @@ from dataclasses import dataclass
 from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 
 #: Number of decimal places per supported currency.
-CURRENCY_EXPONENTS: dict[str, int] = {"RUB": 2, "XTR": 0}
+CURRENCY_EXPONENTS: dict[str, int] = {"RUB": 2, "XTR": 0, "USD": 2}
 
-CURRENCY_SIGNS: dict[str, str] = {"RUB": "₽", "XTR": "⭐"}
+CURRENCY_SIGNS: dict[str, str] = {"RUB": "₽", "XTR": "⭐", "USD": "$"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,7 +52,8 @@ class Money:
         return f"{self.to_decimal():f}"
 
     def human(self) -> str:
-        """Short display form for messages: ``"990 ₽"``, ``"1 490,50 ₽"``, ``"500 ⭐"``."""
+        """Short display form for messages: ``"990 ₽"``, ``"1 490,50 ₽"``, ``"500 ⭐"``,
+        ``"9,99 $"``."""
         value = self.to_decimal()
         whole = int(value)
         fraction = value - whole

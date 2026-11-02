@@ -17,6 +17,7 @@ from enum import StrEnum
 
 from aiogram.filters.callback_data import CallbackData
 
+from paidclub.billing import MEMBER_RENEWED
 from paidclub.club import CheckoutLink, SubscriptionView
 from paidclub.config import PlanConfig
 from paidclub.domain.subscriptions import SubStatus
@@ -48,13 +49,31 @@ PROVIDER_LABELS: dict[str, str] = {
     "fake": "Тестовая оплата",
     "yookassa": "Банковская карта",
     "stars": "Telegram Stars",
+    "cryptopay": "Криптовалюта",
 }
 
 _PROVIDER_NOTES: dict[str, str] = {
     "fake": "демо: деньги не списываются, исход платежа выбирается на странице оплаты",
     "yookassa": "карта сохранится для автопродления",
     "stars": "продлевает сам Telegram раз в 30 дней",
+    "cryptopay": "счёт в @CryptoBot; автопродления нет, каждый период оплачивается отдельно, "
+    "бот заранее напомнит",
 }
+
+#: Under the plans, when every way to pay renews on its own (a saved card, Stars).
+AUTO_RENEWAL = (
+    "Подписка продлевается автоматически, отключить автопродление можно в любой момент в /status."
+)
+#: When every way to pay is crypto, which cannot renew on its own.
+NO_AUTO_RENEWAL = (
+    "Подписка сама не продлевается: каждый период оплачивается отдельно, бот заранее напомнит "
+    "об оплате."
+)
+#: When crypto is offered next to a card or Stars.
+CRYPTO_RENEWAL = (
+    "При оплате криптовалютой автопродления нет: каждый период оплачивается отдельно, бот "
+    "заранее напомнит."
+)
 
 DEFAULT_INTRO = (
     "Здравствуйте! Это бот закрытого клуба. После оплаты подписки бот пришлёт ссылку "
@@ -146,12 +165,15 @@ def plans(catalog: Sequence[PlanOffers], *, intro: str = DEFAULT_INTRO) -> Messa
     if not available:
         return MessageDraft(f"{intro}\n\nОплата сейчас недоступна, загляните позже.")
     lines = [f"• {item.plan.title} — {_prices(item.offers, ' или ')}" for item in available]
-    text = (
-        f"{intro}\n\nТарифы:\n"
-        + "\n".join(lines)
-        + "\n\nПодписка продлевается автоматически, отключить автопродление можно "
-        "в любой момент в /status."
-    )
+    providers = {offer.provider for item in available for offer in item.offers}
+    by_hand = providers & MEMBER_RENEWED
+    if not by_hand:
+        renewal = AUTO_RENEWAL
+    elif by_hand == providers:
+        renewal = NO_AUTO_RENEWAL
+    else:
+        renewal = f"{AUTO_RENEWAL} {CRYPTO_RENEWAL}"
+    text = f"{intro}\n\nТарифы:\n" + "\n".join(lines) + f"\n\n{renewal}"
     buttons = tuple(
         Button(
             f"{item.plan.title} — {_prices(item.offers, ' / ')}",
@@ -165,10 +187,16 @@ def plans(catalog: Sequence[PlanOffers], *, intro: str = DEFAULT_INTRO) -> Messa
 def plan_details(item: PlanOffers) -> MessageDraft:
     plan = item.plan
     period = period_text(plan.period_unit, plan.period_count)
+    if all(offer.provider in MEMBER_RENEWED for offer in item.offers):
+        renewal = "Каждый период оплачивается отдельно: бот заранее напомнит об оплате."
+    else:
+        renewal = (
+            f"Подписка продлевается {every_text(plan.period_unit, plan.period_count)}, "
+            "пока вы не отключите автопродление."
+        )
     lines = [
         f"Тариф «{plan.title}»: {_prices(item.offers, ' или ')} за {period}.",
-        f"Подписка продлевается {every_text(plan.period_unit, plan.period_count)}, "
-        "пока вы не отключите автопродление.",
+        renewal,
         "",
         "Способы оплаты:",
     ]
@@ -201,6 +229,11 @@ def checkout(link: CheckoutLink, *, plan_title: str, renewal: bool = False) -> M
         lines.append("Это тестовая страница оплаты: на ней можно выбрать, пройдёт платёж или нет.")
     elif link.provider == "stars":
         lines.append("Оплата Telegram Stars откроется прямо в Telegram.")
+    elif link.provider == "cryptopay":
+        lines.append(
+            "Счёт откроется в @CryptoBot: цена в долларах, монеты считаются по курсу @CryptoBot. "
+            "Если счёт истечёт, просто запросите новый."
+        )
     buttons = [Button(f"Оплатить {amount}", url=link.url)]
     buttons.append(_to_status() if renewal else _back_to_plans())
     return MessageDraft("\n\n".join(lines), tuple(buttons))
@@ -225,6 +258,7 @@ def status(
         return fmt_date(moment, tz)
 
     price = view.price.human()
+    by_hand = view.provider in MEMBER_RENEWED
     lines: list[str] = []
     buttons: list[Button] = []
     menu_pay = Menu(go=Go.PAY, sub=view.id).pack()
@@ -237,6 +271,13 @@ def status(
         if provider_renewed:
             lines.append(f"Автопродление включено: Telegram сам продлит подписку за {price}.")
             buttons.append(Button("Отключить автопродление", callback_data=menu_cancel))
+        elif by_hand:
+            # Nothing renews on its own, so there is nothing to switch off either.
+            lines.append(
+                "При оплате криптовалютой подписка сама не продлевается: оплатите следующий "
+                f"период до {date(view.period_end)}, чтобы не потерять доступ."
+            )
+            buttons.append(Button(f"Оплатить продление {price}", callback_data=menu_pay))
         elif view.has_saved_method:
             charge_at = view.next_charge_at or view.period_end
             lines.append(
@@ -259,10 +300,14 @@ def status(
                     f"Telegram не продлил подписку «{plan_title}» — возможно, на балансе "
                     "не хватило Stars."
                 )
+            elif by_hand:
+                lines.append(
+                    f"Оплаченный период подписки «{plan_title}» закончился, а следующий не оплачен."
+                )
             else:
                 lines.append(f"Не получилось списать {price} за продление подписки «{plan_title}».")
             lines.append(f"Доступ к клубу сохранится до {date(view.grace_until)}.")
-            if view.next_charge_at is not None and not provider_renewed:
+            if view.next_charge_at is not None and not (provider_renewed or by_hand):
                 lines.append(f"Повторим попытку {date(view.next_charge_at)}.")
         buttons.append(Button(f"Оплатить {price}", callback_data=menu_pay))
     elif view.status is SubStatus.CANCELED:

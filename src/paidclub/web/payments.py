@@ -1,10 +1,10 @@
 """Payment webhooks: ``POST /webhooks/{provider}``.
 
 The route only moves bytes. The provider verifies the notification (an HMAC for the fake
-provider; for YooKassa, a fresh ``GET`` of the payment with the shop credentials) and turns it
-into events, and every event goes through :func:`paidclub.payments.apply_event`, where
-duplicates are recognised. A webhook delivered twice therefore answers 200 twice and pays the
-period once.
+provider; for YooKassa, a fresh ``GET`` of the payment with the shop credentials; for Crypto
+Pay, both: the HMAC first, then ``getInvoices``) and turns it into events, and every event goes
+through :func:`paidclub.payments.apply_event`, where duplicates are recognised. A webhook
+delivered twice therefore answers 200 twice and pays the period once.
 
 With ``PAIDCLUB_YOOKASSA_WEBHOOK_TOKEN`` set, YooKassa notifications are accepted only at
 ``/webhooks/yookassa/<token>``. Verifying a YooKassa notification costs a request to the shop

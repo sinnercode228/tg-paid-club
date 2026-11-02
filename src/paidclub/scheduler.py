@@ -9,7 +9,9 @@ A tick does, in this order:
    idempotence key, which the provider deduplicates. The result goes through
    :func:`paidclub.payments.apply_payment_event` like any webhook. Provider-renewed
    subscriptions (Stars) are not charged: if the renewal payment has not arrived by
-   ``next_charge_at`` they go past due without retries.
+   ``next_charge_at`` they go past due without retries. Crypto has nothing to charge: its
+   provider answers ``no_saved_payment_method`` at once, the subscription goes past due, and
+   each dunning step sends the member the "pay" button again.
 
    A charge whose outcome stays unknown (the provider keeps timing out) is repeated with the
    same key, and the owner is told after :data:`ALERT_AFTER_CALLS` tries. At the end of the
@@ -46,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from paidclub import texts
 from paidclub.access import AccessRevoker, revoke_expired_access
+from paidclub.billing import MEMBER_RENEWED
 from paidclub.billing.base import (
     PROVIDER_NOT_CONFIGURED,
     ChargeResult,
@@ -643,6 +646,8 @@ class Scheduler:
             )
         if provider_renewed:
             template = texts.reminder_stars
+        elif sub.provider in MEMBER_RENEWED:
+            template = texts.reminder_crypto
         elif sub.payment_method_id is None:
             template = texts.reminder_manual
         else:

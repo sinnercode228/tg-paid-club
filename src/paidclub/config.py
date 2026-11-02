@@ -20,9 +20,9 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from paidclub.domain.subscriptions import BillingPolicy, PeriodUnit
-from paidclub.money import Money
+from paidclub.money import CURRENCY_EXPONENTS, Money
 
-ProviderName = Literal["fake", "yookassa", "stars"]
+ProviderName = Literal["fake", "yookassa", "stars", "cryptopay"]
 
 #: Telegram Stars subscriptions renew every 30 days; it is the only period the Bot API accepts.
 STARS_SUBSCRIPTION_PERIOD = timedelta(days=30)
@@ -39,6 +39,8 @@ PATH_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{16,128}")
 MIN_STARS_SECRET_BYTES = 16
 #: ``<bot id>:<secret>`` as @BotFather issues it.
 BOT_TOKEN_PATTERN = re.compile(r"[0-9]+:[A-Za-z0-9_-]+")
+#: A coin code as Crypto Pay writes it: ``USDT``, ``TON``, ``BTC``.
+ASSET_PATTERN = re.compile(r"[A-Z0-9]{2,10}")
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 #: Accepted URL schemes and the async driver each one runs on.
 ASYNC_DRIVERS = {
@@ -63,13 +65,19 @@ class PlanConfig(BaseModel):
     price_rub: Decimal | None = Field(default=None, gt=0)
     #: Price in Telegram Stars per 30 days. Only for monthly (or 30-day) plans.
     price_stars: int | None = Field(default=None, gt=0)
+    #: Price in US dollars for crypto invoices, e.g. ``"10.00"``; the member pays it in a coin.
+    price_usd: Decimal | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
     def _check_prices(self) -> Self:
-        if self.price_rub is None and self.price_stars is None:
-            raise ValueError(f"plan {self.code!r} needs price_rub, price_stars or both")
+        if self.price_rub is None and self.price_stars is None and self.price_usd is None:
+            raise ValueError(
+                f"plan {self.code!r} needs price_rub, price_stars, price_usd or several of them"
+            )
         if self.price_rub is not None:
             Money.from_decimal(self.price_rub, "RUB")  # rejects more than two decimal places
+        if self.price_usd is not None:
+            Money.from_decimal(self.price_usd, "USD")  # cents at most
         if self.price_stars is not None and not self.is_stars_compatible:
             raise ValueError(
                 f"plan {self.code!r}: Telegram Stars subscriptions renew every 30 days, "
@@ -86,7 +94,14 @@ class PlanConfig(BaseModel):
             return Money.from_decimal(self.price_rub, "RUB")
         if currency == "XTR" and self.price_stars is not None:
             return Money(self.price_stars, "XTR")
+        if currency == "USD" and self.price_usd is not None:
+            return Money.from_decimal(self.price_usd, "USD")
         return None
+
+    @property
+    def currencies(self) -> list[str]:
+        """The currencies the plan has a price in, rubles first, then Stars, then dollars."""
+        return [code for code in CURRENCY_EXPONENTS if self.price_for(code) is not None]
 
     @property
     def months_equivalent(self) -> Decimal:
@@ -98,10 +113,27 @@ class PlanConfig(BaseModel):
 
 DEFAULT_PLANS: tuple[PlanConfig, ...] = (
     PlanConfig(
-        code="month", title="1 месяц", period_count=1, price_rub=Decimal("990.00"), price_stars=500
+        code="month",
+        title="1 месяц",
+        period_count=1,
+        price_rub=Decimal("990.00"),
+        price_stars=500,
+        price_usd=Decimal("10.00"),
     ),
-    PlanConfig(code="quarter", title="3 месяца", period_count=3, price_rub=Decimal("2490.00")),
-    PlanConfig(code="year", title="12 месяцев", period_count=12, price_rub=Decimal("8900.00")),
+    PlanConfig(
+        code="quarter",
+        title="3 месяца",
+        period_count=3,
+        price_rub=Decimal("2490.00"),
+        price_usd=Decimal("25.00"),
+    ),
+    PlanConfig(
+        code="year",
+        title="12 месяцев",
+        period_count=12,
+        price_rub=Decimal("8900.00"),
+        price_usd=Decimal("90.00"),
+    ),
 )
 
 
@@ -212,6 +244,20 @@ class Settings(BaseSettings):
     #: forged notification sent anywhere else costs no request to the shop API.
     yookassa_webhook_token: SecretStr | None = None
 
+    # --- crypto pay ------------------------------------------------------------------------
+    #: Token of a Crypto Pay app: @CryptoBot, Crypto Pay, Create App (@CryptoTestnetBot for
+    #: the testnet).
+    cryptopay_api_token: SecretStr | None = None
+    #: ``https://testnet-pay.crypt.bot/api`` for the testnet, whose coins are not real.
+    cryptopay_api_url: str = "https://pay.crypt.bot/api"
+    #: Coins an invoice can be paid with. The price itself is in dollars (``price_usd``).
+    cryptopay_assets: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ["USDT", "TON"]
+    )
+    #: An unpaid invoice expires after this long and the member asks for a new one. At most a
+    #: day, so it has expired while its checkout is still looked up.
+    cryptopay_invoice_lifetime_minutes: int = Field(default=60, ge=1, le=1440)
+
     # --- workers ---------------------------------------------------------------------------
     scheduler_interval_seconds: float = Field(default=30, gt=0)
     #: How long a worker owns a claimed renewal or notification before another may take it.
@@ -229,6 +275,7 @@ class Settings(BaseSettings):
         "providers",
         "dunning_retry_days",
         "reminder_days",
+        "cryptopay_assets",
         mode="before",
     )
     @classmethod
@@ -325,6 +372,18 @@ class Settings(BaseSettings):
             raise ValueError("must be 16-128 characters: letters A-Z, a-z, digits, _ and -")
         return value
 
+    @field_validator("cryptopay_assets")
+    @classmethod
+    def _check_assets(cls, value: list[str]) -> list[str]:
+        assets = [asset.strip().upper() for asset in value]
+        if not assets:
+            raise ValueError("name at least one coin, such as USDT")
+        if not all(ASSET_PATTERN.fullmatch(asset) for asset in assets):
+            raise ValueError(f"must be coin codes such as USDT,TON, got {value!r}")
+        if len(assets) != len(set(assets)):
+            raise ValueError("coins must not repeat")
+        return assets
+
     @model_validator(mode="after")
     def _check_consistency(self) -> Self:
         if any(day <= 0 for day in self.dunning_retry_days):
@@ -353,6 +412,10 @@ class Settings(BaseSettings):
             self.yookassa_shop_id and self.yookassa_secret_key
         ):
             raise ValueError("the yookassa provider needs yookassa_shop_id and yookassa_secret_key")
+        if "cryptopay" in self.providers and self.cryptopay_api_token is None:
+            raise ValueError("the cryptopay provider needs cryptopay_api_token")
+        if "cryptopay" in self.providers and not any(p.price_usd for p in self.plans):
+            raise ValueError("the cryptopay provider needs at least one plan with price_usd")
         if self.env == "prod" and "fake" in self.providers:
             raise ValueError("the fake provider is for demos and tests; disable it in prod")
         if self.bot_mode == "webhook":

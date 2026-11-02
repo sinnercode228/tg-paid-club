@@ -34,7 +34,8 @@ log = logging.getLogger(__name__)
 
 #: The first lookup: a member who pays at once has been applied by the notification by then.
 FIRST_CHECK = timedelta(minutes=5)
-#: Lookups stop after this long; YooKassa cancels an unpaid payment well before.
+#: Lookups stop after this long; YooKassa cancels an unpaid payment, and a Crypto Pay invoice
+#: expires (``PAIDCLUB_CRYPTOPAY_INVOICE_LIFETIME_MINUTES``), well before.
 GIVE_UP_AFTER = timedelta(hours=48)
 
 

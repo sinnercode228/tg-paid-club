@@ -166,6 +166,30 @@ def test_yookassa_without_https_is_warned_about() -> None:
     assert "/webhooks/yookassa" in warning.message
 
 
+def test_crypto_pay_without_https_is_warned_about_and_described() -> None:
+    settings = make(
+        providers=["cryptopay"],
+        cryptopay_api_token="12345:AAsecret",
+        cryptopay_api_url="https://testnet-pay.crypt.bot/api",
+        admin_token="t",
+    )
+    [warning] = startup_problems(settings, "web")
+    assert "/webhooks/cryptopay will not receive them" in warning.message
+    text = "\n".join(describe(settings))
+    assert (
+        "cryptopay: https://testnet-pay.crypt.bot/api (testnet), coins USDT, TON, "
+        "webhook URL http://localhost:8000/webhooks/cryptopay"
+    ) in text
+    assert "AAsecret" not in text
+    public = make(
+        providers=["cryptopay"],
+        cryptopay_api_token="12345:AAsecret",
+        public_base_url="https://club.example",
+        admin_token="t" * 16,
+    )
+    assert startup_problems(public, "web") == []
+
+
 def test_describe_hides_secrets() -> None:
     settings = make(
         bot_token=TOKEN,
@@ -178,6 +202,7 @@ def test_describe_hides_secrets() -> None:
     assert "admin-secret" not in text
     assert "postgresql+asyncpg://club:***@db/club" in text
     assert "/admin bearer token" in text
+    assert "month (1 month, 990.00 RUB / 500 XTR / 10.00 USD)" in text
     assert safe_database_url("sqlite+aiosqlite:///./x.db") == "sqlite+aiosqlite:///./x.db"
 
 
