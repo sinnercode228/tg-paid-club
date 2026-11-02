@@ -576,6 +576,73 @@ async def test_lookups_of_ids_crypto_pay_cannot_have_ask_nothing(
         await cryptopay.check_payment(foreign)
 
 
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"status": "refunded"},
+        {"currency_type": "crypto"},
+        {"created_at": None},
+        {"amount": "10.005"},
+        {"fiat": "EUR"},
+        {"amount": {"value": "10"}},
+    ],
+)
+async def test_a_malformed_invoice_is_a_provider_error_not_a_payment(
+    core: Core,
+    api: FakeCryptoPay,
+    cryptopay: CryptoPayProvider,
+    http: httpx.AsyncClient,
+    change: dict[str, Any],
+) -> None:
+    sub_id, invoice_id = await checkout(core)
+    api.pay(invoice_id)
+    api.invoices[int(invoice_id)].update(change)
+
+    with pytest.raises(CryptoPayError, match="malformed"):
+        await cryptopay.check_payment(invoice_id)
+    headers, body = api.update(invoice_id)
+    response = await http.post("/webhooks/cryptopay", content=body, headers=headers)
+    assert response.status_code == 502  # Crypto Pay may send it again; nothing was applied
+    assert (await load_sub(core, sub_id)).status is SubStatus.PENDING
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        _ok({"items": "nope"}),
+        _ok({"invoice_id": 7001}),
+        httpx.Response(200, json={"ok": True}),
+        httpx.Response(200, json=["not", "an", "envelope"]),
+    ],
+)
+async def test_answers_that_are_not_invoices_are_provider_errors(
+    core: Core, api: FakeCryptoPay, cryptopay: CryptoPayProvider, answer: httpx.Response
+) -> None:
+    api.script.append(answer)
+    with pytest.raises(CryptoPayError):
+        await cryptopay.get_invoice("7001")
+
+
+async def test_an_invoice_without_a_link_to_pay_is_a_provider_error(
+    core: Core, api: FakeCryptoPay, cryptopay: CryptoPayProvider
+) -> None:
+    api.script.append(_ok({"invoice_id": 7001, "status": "active"}))
+    with pytest.raises(CryptoPayError, match="no link to pay"):
+        await checkout(core)
+    api.script.append(_ok(None))
+    with pytest.raises(CryptoPayError, match="not an invoice"):
+        await checkout(core)
+
+
+def test_the_provider_refuses_settings_it_cannot_work_with() -> None:
+    with pytest.raises(ValueError, match="API token"):
+        CryptoPayProvider(api_token="", assets=["USDT"])
+    with pytest.raises(ValueError, match="at least one coin"):
+        CryptoPayProvider(api_token=TOKEN, assets=[])
+    with pytest.raises(ValueError, match="lifetime"):
+        CryptoPayProvider(api_token=TOKEN, assets=["USDT"], invoice_lifetime=timedelta(days=2))
+
+
 @pytest.mark.parametrize("amount", ["10", "10.00", Decimal("10.0"), 10])
 def test_invoice_amounts_become_cents_without_floats(amount: object) -> None:
     invoice = {
