@@ -37,7 +37,12 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
 from fastapi import FastAPI
 
-from paidclub.billing.stars import StarsProvider, create_stars_router, stars_payments
+from paidclub.billing.stars import (
+    StarsProvider,
+    create_stars_router,
+    signed_live_subscriptions,
+    stars_payments,
+)
 from paidclub.billing.yookassa import YooKassaProvider
 from paidclub.bot.admin import ADMIN_COMMANDS, create_admin_router
 from paidclub.bot.app import create_bot, create_dispatcher
@@ -112,7 +117,7 @@ async def build_app(
             return ClubApp(core=core, web=create_app(core), closers=closers)
 
         bot = create_bot(settings, session=bot_session)
-        stars = stars_payments(core, secret=_stars_secret(settings))
+        stars = stars_payments(core, secret=await _stars_secret(core))
         # Registered even with Stars switched off in PAIDCLUB_PROVIDERS, which only decides
         # what is sold: members who subscribed earlier are still renewed by Telegram, their
         # payments must apply, and cancelling must still reach Telegram.
@@ -154,17 +159,25 @@ async def build_app(
         raise
 
 
-def _stars_secret(settings: Settings) -> str:
+async def _stars_secret(core: Core) -> str:
     """``PAIDCLUB_STARS_PAYLOAD_SECRET``, or one made up for this process.
 
     ``paidclub check`` refuses to run without it while Stars is sold. Without it nothing new
     is signed, and only a Stars subscription signed with a secret that was removed since would
-    have its renewals refunded.
+    have its renewals refunded: that is logged as an error while such subscriptions are live.
     """
+    settings = core.settings
     if settings.stars_payload_secret is not None:
         return settings.stars_payload_secret.get_secret_value()
     if "stars" in settings.providers:
         log.warning("PAIDCLUB_STARS_PAYLOAD_SECRET is not set: Stars invoices break on restart")
+    elif signed := await signed_live_subscriptions(core):
+        log.error(
+            "PAIDCLUB_STARS_PAYLOAD_SECRET is not set, but %d live Stars subscription(s) renew "
+            "with payloads signed with it: Telegram's renewals would be refunded. Set it back "
+            "to the secret they were signed with",
+            signed,
+        )
     return secrets.token_urlsafe(32)
 
 

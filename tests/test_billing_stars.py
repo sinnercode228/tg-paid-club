@@ -881,6 +881,41 @@ async def test_cancel_reaches_telegram_after_stars_is_switched_off(
         await app.aclose()
 
 
+async def test_starting_without_the_payload_secret_that_live_subscriptions_carry_is_an_error(
+    core: Core,
+    session: RecordingSession,
+    dispatcher: Dispatcher,
+    bot: Bot,
+    clock: FakeClock,
+    settings: Settings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With "stars" out of PAIDCLUB_PROVIDERS, paidclub check no longer asks for the secret.
+    Telegram still renews with the payload signed with it, and a secret made up at start
+    would refund each renewal, so the start says so while such subscriptions are live."""
+    off = settings.model_copy(
+        update={"bot_token": SecretStr("42:TEST-TOKEN"), "providers": ["fake"]}
+    )
+
+    async def start_logs() -> list[str]:
+        caplog.clear()
+        app = await build_app(off, bot_session=RecordingSession(), clock=clock)
+        await app.aclose()
+        return [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+
+    assert await start_logs() == []
+    await paid_stars_subscription(core, session, dispatcher, bot, clock)
+    [line] = await start_logs()
+    assert line.startswith("PAIDCLUB_STARS_PAYLOAD_SECRET is not set")
+    assert "1 live Stars subscription" in line
+
+    kept = off.model_copy(update={"stars_payload_secret": SecretStr(PAYLOAD_SECRET)})
+    caplog.clear()
+    app = await build_app(kept, bot_session=RecordingSession(), clock=clock)
+    await app.aclose()
+    assert [r for r in caplog.records if r.levelname == "ERROR"] == []
+
+
 async def test_without_the_stars_provider_cancel_is_refused_rather_than_pretended(
     core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot, clock: FakeClock
 ) -> None:

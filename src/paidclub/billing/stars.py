@@ -57,7 +57,7 @@ from aiogram_stars import Payment as StarsPayment
 from aiogram_stars import Refund as StarsRefund
 from aiogram_stars.sqlalchemy import SqlAlchemyStorage
 from aiogram_stars.sqlalchemy import metadata as stars_metadata
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -75,7 +75,7 @@ from paidclub.billing.base import (
 )
 from paidclub.container import Core
 from paidclub.db import in_transaction, insert_ignore
-from paidclub.domain.subscriptions import SubStatus
+from paidclub.domain.subscriptions import LIVE_STATUSES, SubStatus
 from paidclub.models import PaymentOutcome, StarsPaymentStatus, StarsPaymentUpdate, Subscription
 from paidclub.money import Money
 from paidclub.payments import ApplyResult, alert_owner, apply_payment_event
@@ -398,6 +398,22 @@ def stars_payments(
         checkout_error=ERROR_UNAVAILABLE,
         clock=core.clock.now,
     )
+
+
+async def signed_live_subscriptions(core: Core) -> int:
+    """How many live Stars subscriptions Telegram renews with a payload signed by aiogram-stars.
+
+    Their first charge is in ``stars_payments``; those bought before signing are not.
+    """
+    charges = stars_metadata.tables["stars_payments"]
+    async with core.sessions() as session:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(Subscription)
+            .join(charges, charges.c.charge_id == Subscription.payment_method_id)
+            .where(Subscription.provider == PROVIDER_NAME, Subscription.status.in_(LIVE_STATUSES))
+        )
+    return count or 0
 
 
 class PaymentNotStored(Exception):
