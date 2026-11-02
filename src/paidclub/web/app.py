@@ -3,6 +3,8 @@
 * ``POST /webhooks/{provider}``: payment notifications (:mod:`paidclub.web.payments`);
 * ``GET``/``POST /fake-checkout/{token}``: the demo payment page, 404 unless the fake provider
   is enabled (:mod:`paidclub.web.fake_checkout`);
+* ``GET /ton/pay/{comment}``: the USDT-on-TON payment page, 404 unless the TON provider is
+  enabled (:mod:`paidclub.web.ton_checkout`);
 * ``/admin``: the owner's dashboard and CSV export (:mod:`paidclub.web.admin`);
 * ``GET /paid``: where a member lands after a provider's payment page; it sends them back to
   the bot (:mod:`paidclub.web.pages`);
@@ -30,6 +32,7 @@ from paidclub.web.fake_checkout import create_fake_checkout_router
 from paidclub.web.pages import BotUsername, create_pages_router
 from paidclub.web.payments import create_webhook_router
 from paidclub.web.telegram import TelegramWebhook
+from paidclub.web.ton_checkout import create_ton_checkout_router
 
 log = logging.getLogger(__name__)
 
@@ -54,6 +57,7 @@ def create_app(
     )
     app.include_router(create_webhook_router(core))
     app.include_router(create_fake_checkout_router(core))
+    app.include_router(create_ton_checkout_router(core))
     app.include_router(create_admin_router(core))
     app.include_router(create_pages_router(bot_username))
     if telegram is not None:

@@ -190,6 +190,25 @@ def test_crypto_pay_without_https_is_warned_about_and_described() -> None:
     assert startup_problems(public, "web") == []
 
 
+def test_ton_on_a_local_address_is_warned_about_and_described() -> None:
+    wallet = "UQAFCtZxQ5QuAD1dZawOP1Qn7pv3xVhQOE8KyDGP0uiknz1V"
+    settings = make(providers=["ton"], ton_wallet_address=wallet, admin_token="t")
+    [warning] = startup_problems(settings, "web")
+    assert "/ton/pay/" in warning.message
+    text = "\n".join(describe(settings))
+    assert f"ton: wallet {wallet}, jetton EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs" in text
+    assert "without an API key, polled every 15 s" in text
+    public = make(
+        providers=["ton"],
+        ton_wallet_address=wallet,
+        ton_api_key="secret-key",
+        public_base_url="https://club.example",
+        admin_token="t" * 16,
+    )
+    assert startup_problems(public, "web") == []
+    assert "secret-key" not in "\n".join(describe(public))
+
+
 def test_describe_hides_secrets() -> None:
     settings = make(
         bot_token=TOKEN,

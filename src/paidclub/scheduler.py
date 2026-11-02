@@ -24,7 +24,9 @@ A tick does, in this order:
    the member cancelled is still recorded. Checkout payments whose notification may have
    been lost are looked up the same way (:mod:`paidclub.checkouts`), and Telegram Stars
    payments that were stored but failed to apply are applied again
-   (:func:`paidclub.billing.stars.retry_stored_payments`).
+   (:func:`paidclub.billing.stars.retry_stored_payments`). The owner's TON wallet is read
+   once, if a USDT checkout is waiting, and its transfers are matched to checkouts by comment
+   (:func:`paidclub.ton_payments.poll_ton_wallet`).
 3. **Expiry.** Past-due subscriptions whose grace window closed (and that have no retry due)
    and canceled subscriptions whose paid period ended become ``expired``.
 4. **Access.** Members of expired subscriptions are removed from the club chats.
@@ -67,6 +69,7 @@ from paidclub.models import ChargeAttempt, ChargeAttemptStatus, PaymentOutcome, 
 from paidclub.notifications import MessageDraft, enqueue
 from paidclub.payments import alert_owner, apply_payment_event, notify_renewal_failed
 from paidclub.repo import price_of, state_of, write_state
+from paidclub.ton_payments import poll_ton_wallet
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +96,11 @@ class TickReport:
     checkouts_recovered: int = 0
     #: Stored Telegram Stars payments applied on a retry.
     stars_applied: int = 0
+    #: Requests to toncenter (at most one a pass), new USDT transfers found, and the TON
+    #: checkouts they completed.
+    ton_requests: int = 0
+    ton_transfers: int = 0
+    ton_paid: int = 0
     renewals_missing: int = 0
     expired: int = 0
     removed: int = 0
@@ -132,6 +140,7 @@ class Scheduler:
             self._pending_charges,
             self._checkouts,
             self._stars_payments,
+            self._ton_payments,
             self._expire,
             self._revoke,
             self._remind,
@@ -505,6 +514,13 @@ class Scheduler:
 
     async def _stars_payments(self, report: TickReport) -> None:
         report.stars_applied += await retry_stored_payments(self.core, batch_size=self.batch_size)
+
+    async def _ton_payments(self, report: TickReport) -> None:
+        result = await poll_ton_wallet(self.core)
+        report.ton_requests += result.requests
+        report.ton_transfers += result.transfers
+        report.ton_paid += result.paid
+        report.provider_errors += result.errors
 
     # --- 3. expiry -------------------------------------------------------------------------
 

@@ -50,6 +50,7 @@ PROVIDER_LABELS: dict[str, str] = {
     "yookassa": "Банковская карта",
     "stars": "Telegram Stars",
     "cryptopay": "Криптовалюта",
+    "ton": "USDT на кошелёк (TON)",
 }
 
 _PROVIDER_NOTES: dict[str, str] = {
@@ -57,6 +58,8 @@ _PROVIDER_NOTES: dict[str, str] = {
     "yookassa": "карта сохранится для автопродления",
     "stars": "продлевает сам Telegram раз в 30 дней",
     "cryptopay": "счёт в @CryptoBot; автопродления нет, каждый период оплачивается отдельно, "
+    "бот заранее напомнит",
+    "ton": "перевод USDT в сети TON прямо на кошелёк клуба, без посредников; автопродления нет, "
     "бот заранее напомнит",
 }
 
@@ -233,6 +236,11 @@ def checkout(link: CheckoutLink, *, plan_title: str, renewal: bool = False) -> M
         lines.append(
             "Счёт откроется в @CryptoBot: цена в долларах, монеты считаются по курсу @CryptoBot. "
             "Если счёт истечёт, просто запросите новый."
+        )
+    elif link.provider == "ton":
+        lines.append(
+            "Откроется страница с адресом кошелька, суммой и комментарием. Переведите USDT в "
+            "сети TON обязательно с этим комментарием: бот подтвердит оплату в течение минуты."
         )
     buttons = [Button(f"Оплатить {amount}", url=link.url)]
     buttons.append(_to_status() if renewal else _back_to_plans())

@@ -415,6 +415,89 @@ class StarsPaymentUpdate(Base):
     __table_args__ = (Index("ix_stars_payment_updates_due", "status", "next_attempt_at"),)
 
 
+# --- USDT on TON ------------------------------------------------------------------------------
+
+
+class TonInvoiceStatus(StrEnum):
+    #: Waiting for USDT with its comment, or for the rest of a partial payment.
+    OPEN = "open"
+    #: The transfers with its comment added up to the price; applied through core.
+    PAID = "paid"
+    #: Its time ran out. A transfer that still comes with its comment opens it again.
+    EXPIRED = "expired"
+
+
+class TonInvoice(Base):
+    """What a member was asked to send to the owner's TON wallet: an amount of USDT with a
+    comment unique to this checkout. Transfers are matched to it by that comment and added
+    up, so a member can top up a payment that fell short."""
+
+    __tablename__ = "ton_invoices"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subscription_id: Mapped[int] = mapped_column(ForeignKey("subscriptions.id"))
+    for_period: Mapped[int]
+    #: Normalised (upper case, letters and digits only), as matched against transfers.
+    comment: Mapped[str] = mapped_column(String(32), unique=True)
+    #: The price and what arrived so far, in the jetton's smallest units (USDT: millionths).
+    amount_units: Mapped[int] = mapped_column(BigInteger)
+    received_units: Mapped[int] = mapped_column(BigInteger, default=0)
+    status: Mapped[TonInvoiceStatus] = mapped_column(_enum(TonInvoiceStatus))
+    #: The payment outcome once paid (``applied``, ``needs_refund``, ...).
+    outcome: Mapped[str | None] = mapped_column(String(24))
+    created_at: Mapped[datetime]
+    expires_at: Mapped[datetime]
+    paid_at: Mapped[datetime | None]
+    version: Mapped[int] = mapped_column(default=1)
+
+    subscription: Mapped[Subscription] = relationship(lazy="joined")
+
+    __mapper_args__ = {"version_id_col": version}  # noqa: RUF012
+    __table_args__ = (Index("ix_ton_invoices_status", "status", "expires_at"),)
+
+
+class TonTransfer(Base):
+    """Every incoming USDT transfer the wallet poll found, once per transaction hash, matched
+    to an invoice by its comment or left for the owner (``invoice_id`` empty)."""
+
+    __tablename__ = "ton_transfers"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    #: The hash of the transaction that credited the owner's jetton wallet.
+    tx_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    lt: Mapped[int] = mapped_column(BigInteger)
+    amount_units: Mapped[int] = mapped_column(BigInteger)
+    comment: Mapped[str | None] = mapped_column(String(255))
+    #: The payer's wallet (raw form), as the sending jetton wallet reported it.
+    sender: Mapped[str | None] = mapped_column(String(70))
+    invoice_id: Mapped[int | None] = mapped_column(ForeignKey("ton_invoices.id"), index=True)
+    occurred_at: Mapped[datetime]
+    created_at: Mapped[datetime]
+
+
+class TonWallet(Base):
+    """The owner's USDT jetton wallet, pinned once from the jetton master's own answer, and
+    how far its transactions have been read."""
+
+    __tablename__ = "ton_wallets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    #: Raw forms of the owner's wallet and the jetton master.
+    owner_address: Mapped[str] = mapped_column(String(70))
+    jetton_master: Mapped[str] = mapped_column(String(70))
+    #: ``get_wallet_address(owner)`` of the master; only transfers into it are accepted.
+    jetton_wallet: Mapped[str | None] = mapped_column(String(70))
+    #: The logical time of the last transaction read; the next poll starts after it.
+    last_lt: Mapped[int | None] = mapped_column(BigInteger)
+    #: When a worker last asked the indexer; moving it forward is the claim.
+    polled_at: Mapped[datetime | None]
+    created_at: Mapped[datetime]
+
+    __table_args__ = (
+        UniqueConstraint("owner_address", "jetton_master", name="uq_ton_wallets_owner_master"),
+    )
+
+
 # --- notifications and access ------------------------------------------------------------------
 
 

@@ -226,6 +226,21 @@ def test_a_crypto_checkout_opens_in_crypto_bot() -> None:
     )
 
 
+def test_a_ton_checkout_explains_the_comment() -> None:
+    link = CheckoutLink(7, "ton", USD, "https://club.example/ton/pay/PC7K3M9QX2")
+    draft = screens.checkout(link, plan_title="1 месяц")
+    assert "Переведите USDT в сети TON обязательно с этим комментарием" in draft.text
+    assert draft.buttons[0].url == "https://club.example/ton/pay/PC7K3M9QX2"
+    month = PlanConfig(code="month", title="1 месяц", price_usd=Decimal("10"))
+    details = screens.plan_details(PlanOffers(month, (Offer("ton", USD),)))
+    assert "• USDT на кошелёк (TON) — 10 $ (перевод USDT в сети TON прямо на кошелёк" in (
+        details.text
+    )
+    assert screens.plans([PlanOffers(month, (Offer("ton", USD),))]).text.endswith(
+        screens.NO_AUTO_RENEWAL
+    )
+
+
 def test_menu_callback_data_fits_telegram_limit_for_the_longest_plan_code() -> None:
     data = Menu(go=Go.BUY, plan="x" * 32, provider="cryptopay", sub=2**31).pack()
     assert len(data.encode()) <= 64

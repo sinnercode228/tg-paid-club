@@ -98,6 +98,7 @@ def test_crypto_pay_settings(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_ton_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PAIDCLUB_PROVIDERS", "ton")
     monkeypatch.setenv(
         "PAIDCLUB_TON_WALLET_ADDRESS",
         " 0:B113A994B5024A16719F69139328EB759596C38A25F59028B146FECDC3621DFE ",
@@ -149,6 +150,15 @@ def test_protected_users_are_the_owner_and_admins() -> None:
         ({"cryptopay_assets": "[]"}, "at least one coin"),
         ({"cryptopay_assets": "TON,ton"}, "must not repeat"),
         ({"cryptopay_invoice_lifetime_minutes": 1441}, "less than or equal to 1440"),
+        ({"providers": ["ton"]}, "ton_wallet_address"),
+        (
+            {
+                "providers": ["ton"],
+                "ton_wallet_address": "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs",
+                "plans": [{"code": "m", "title": "M", "price_rub": "1.00"}],
+            },
+            "price_usd",
+        ),
         ({"ton_wallet_address": "my wallet"}, "must be a TON address"),
         ({"ton_jetton_master": "EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDt"}, "TON address"),
         ({"ton_jetton_decimals": 1}, "greater than or equal to 2"),

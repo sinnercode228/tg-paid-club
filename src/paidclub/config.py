@@ -23,7 +23,7 @@ from paidclub.billing.tonaddress import InvalidAddress, TonAddress
 from paidclub.domain.subscriptions import BillingPolicy, PeriodUnit
 from paidclub.money import CURRENCY_EXPONENTS, Money
 
-ProviderName = Literal["fake", "yookassa", "stars", "cryptopay"]
+ProviderName = Literal["fake", "yookassa", "stars", "cryptopay", "ton"]
 
 #: Telegram Stars subscriptions renew every 30 days; it is the only period the Bot API accepts.
 STARS_SUBSCRIPTION_PERIOD = timedelta(days=30)
@@ -437,6 +437,10 @@ class Settings(BaseSettings):
             raise ValueError("the cryptopay provider needs cryptopay_api_token")
         if "cryptopay" in self.providers and not any(p.price_usd for p in self.plans):
             raise ValueError("the cryptopay provider needs at least one plan with price_usd")
+        if "ton" in self.providers and self.ton_wallet_address is None:
+            raise ValueError("the ton provider needs ton_wallet_address")
+        if "ton" in self.providers and not any(p.price_usd for p in self.plans):
+            raise ValueError("the ton provider needs at least one plan with price_usd")
         if self.env == "prod" and "fake" in self.providers:
             raise ValueError("the fake provider is for demos and tests; disable it in prod")
         if self.bot_mode == "webhook":

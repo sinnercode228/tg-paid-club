@@ -38,6 +38,7 @@ from fastapi import FastAPI
 
 from paidclub.billing.cryptopay import CryptoPayProvider
 from paidclub.billing.stars import StarsProvider, create_stars_router
+from paidclub.billing.ton import TonProvider
 from paidclub.billing.yookassa import YooKassaProvider
 from paidclub.bot.admin import ADMIN_COMMANDS, create_admin_router
 from paidclub.bot.app import create_bot, create_dispatcher
@@ -112,6 +113,10 @@ async def build_app(
             cryptopay = CryptoPayProvider.from_settings(settings)
             closers.append(cryptopay.aclose)
             core.providers.register(cryptopay)
+        if "ton" in settings.providers:
+            ton = TonProvider.from_settings(settings)
+            closers.append(ton.aclose)
+            core.providers.register(ton)
         if not with_bot:
             return ClubApp(core=core, web=create_app(core), closers=closers)
 

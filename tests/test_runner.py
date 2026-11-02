@@ -20,6 +20,7 @@ from aiogram.types import Update
 from pydantic import SecretStr
 
 from paidclub.billing.cryptopay import CryptoPayProvider
+from paidclub.billing.ton import TonProvider
 from paidclub.billing.yookassa import YooKassaProvider
 from paidclub.config import Settings
 from paidclub.runner import ClubApp, ComponentStopped, WebServer, build_app, serve
@@ -225,26 +226,30 @@ async def test_a_rejected_bot_token_stops_the_process(run_settings: Settings) ->
 async def test_providers_are_registered_from_settings(run_settings: Settings) -> None:
     settings = run_settings.model_copy(
         update={
-            "providers": ["fake", "yookassa", "stars", "cryptopay"],
+            "providers": ["fake", "yookassa", "stars", "cryptopay", "ton"],
             "yookassa_shop_id": "123",
             "yookassa_secret_key": SecretStr("test_key"),
             "cryptopay_api_token": SecretStr("1:test_token"),
+            "ton_wallet_address": "UQAFCtZxQ5QuAD1dZawOP1Qn7pv3xVhQOE8KyDGP0uiknz1V",
         }
     )
     app = await build_app(settings, bot_session=MockedSession())
     yookassa = app.core.providers.require("yookassa")
     cryptopay = app.core.providers.require("cryptopay")
+    ton = app.core.providers.require("ton")
     await app.aclose()
-    assert app.core.providers.names() == ["fake", "yookassa", "cryptopay", "stars"]
+    assert app.core.providers.names() == ["fake", "yookassa", "cryptopay", "ton", "stars"]
     assert isinstance(yookassa, YooKassaProvider)
     assert yookassa._client.is_closed
     assert isinstance(cryptopay, CryptoPayProvider)
     assert cryptopay._client.is_closed
+    assert isinstance(ton, TonProvider)
+    assert ton._client.is_closed
 
     web_only = await build_app(settings, with_bot=False)
     try:
-        # Stars needs the bot; YooKassa and Crypto Pay webhooks are still served.
-        assert web_only.core.providers.names() == ["fake", "yookassa", "cryptopay"]
+        # Stars needs the bot; webhooks and the TON payment page are still served.
+        assert web_only.core.providers.names() == ["fake", "yookassa", "cryptopay", "ton"]
         assert web_only.bot is None
         assert web_only.scheduler is None
     finally:

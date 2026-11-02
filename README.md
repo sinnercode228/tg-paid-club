@@ -371,7 +371,7 @@ problem.
 | `PAIDCLUB_ADMIN_PASSWORD` | not set | Basic auth password for `/admin`. With neither it nor the token set, `/admin` answers 404. |
 | `PAIDCLUB_CHECKOUT_RETURN_URL` | not set | Where a provider sends the member after paying. The default is `{PAIDCLUB_PUBLIC_BASE_URL}/paid`, a page that sends them back to the bot and promises nothing about the payment. |
 | `PAIDCLUB_PLANS` | `month` 990 ₽, 500 ⭐ or 10 $, `quarter` 2490 ₽ or 25 $, `year` 8900 ₽ or 90 $ | JSON list of plans: `code`, `title`, `period_unit` (`month` or `day`), `period_count` (1–36), `price_rub` (a string such as `"990.00"`), `price_stars` (1-month or 30-day plans only), `price_usd` (a string such as `"10.00"`, for crypto). |
-| `PAIDCLUB_PROVIDERS` | `fake` | `yookassa`, `stars`, `cryptopay` and/or `fake`, in the order members see them. |
+| `PAIDCLUB_PROVIDERS` | `fake` | `yookassa`, `stars`, `cryptopay`, `ton` and/or `fake`, in the order members see them. |
 | `PAIDCLUB_GRACE_DAYS` | `3` | How long access lasts after a failed renewal while retries run. |
 | `PAIDCLUB_DUNNING_RETRY_DAYS` | `1,3` | Retries, in days after the first failure. Ascending, and the last one inside the grace period. |
 | `PAIDCLUB_REMINDER_DAYS` | `3,1` | Reminders, in days before a renewal or the end of access. |

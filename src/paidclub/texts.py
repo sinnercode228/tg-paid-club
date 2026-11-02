@@ -183,6 +183,30 @@ def crypto_renewal_unpaid(
     )
 
 
+def ton_underpaid(
+    *, received: str, total: str, left: str, comment: str, page_url: str
+) -> MessageDraft:
+    """A USDT transfer arrived but the checkout's amount is not reached yet."""
+    return MessageDraft(
+        f"Пришло {received} из {total}. Осталось доплатить {left}: переведите их на тот же "
+        f"кошелёк с тем же комментарием {comment}. Подписка включится, как только придёт вся "
+        "сумма.",
+        (Button("Открыть оплату", url=page_url),),
+    )
+
+
+def ton_partial_expired(
+    *, received: str, total: str, left: str, comment: str, page_url: str
+) -> MessageDraft:
+    """A partly paid USDT checkout ran out of time; a top-up with its comment still counts."""
+    return MessageDraft(
+        f"Время на оплату по счёту {comment} вышло, а пришло только {received} из {total}. "
+        f"Доплатить {left} с тем же комментарием можно и сейчас: подписка включится, как только "
+        "придёт вся сумма. Владелец клуба тоже получил уведомление.",
+        (Button("Открыть оплату", url=page_url),),
+    )
+
+
 def reminder_canceled(
     *,
     subscription_id: int,
