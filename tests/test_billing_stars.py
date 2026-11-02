@@ -518,6 +518,8 @@ async def test_pre_checkout_is_declined_in_time_when_the_check_hangs(
 async def test_an_invoice_this_bot_did_not_sign_is_declined(
     core: Core, session: RecordingSession, dispatcher: Dispatcher, bot: Bot
 ) -> None:
+    """aiogram-stars declines it with its one checkout_error, the club's ERROR_UNAVAILABLE,
+    before the club's check runs; a separate message would need a new aiogram-stars option."""
     sub_id, _ = await stars_invoice(core, session)
     forged = f"{sub_id}:1.AAAAAAAAAAAAAAAAAAAAAA"
 

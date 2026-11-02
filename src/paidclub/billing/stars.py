@@ -101,6 +101,7 @@ ERROR_AMOUNT = "Цена подписки изменилась. Откройте
 ERROR_ALREADY_PAID = "Этот период уже оплачен, повторная оплата не нужна."
 ERROR_STALE = "Этот счёт устарел. Откройте /start и оплатите подписку по новой кнопке."
 ERROR_HAS_SUBSCRIPTION = "У вас уже есть действующая подписка. Проверьте её в /start."
+#: Also shown for a payload that does not verify: aiogram-stars 0.2 has one message for both.
 ERROR_UNAVAILABLE = "Не удалось проверить счёт. Попробуйте ещё раз через минуту."
 #: Sent to a member whose payment arrived but paid for nothing (the owner is alerted by core).
 NOT_APPLIED_NOTICE = (
@@ -354,7 +355,10 @@ def stars_payments(
     ``secret`` signs the payloads (``PAIDCLUB_STARS_PAYLOAD_SECRET``). A check that cannot
     finish in ``pre_checkout_timeout`` seconds (database down or slow) declines the payment
     with :data:`ERROR_UNAVAILABLE`: declining moves no money and the member can try again.
-    A refund that aiogram-stars gives up on (8 attempts, about an hour) is an owner alert.
+    aiogram-stars shows the same ``checkout_error`` for a payload that does not verify (forged
+    or mistyped), so such an invoice reads as unavailable rather than :data:`ERROR_INVALID`;
+    the member who retries is declined again, and nothing is charged. A refund that
+    aiogram-stars gives up on (8 attempts, about an hour) is an owner alert.
     """
 
     async def check(checkout: StarsCheckout) -> None:
