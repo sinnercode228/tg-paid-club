@@ -1,7 +1,7 @@
 # Architecture
 
 One process runs four things on one asyncio loop ([`runner.py`](../src/paidclub/runner.py)): the
-aiogram dispatcher (polling or webhook), the FastAPI app (payment webhooks, the fake checkout page,
+aiogram dispatcher (polling or webhook), the FastAPI app (payment webhooks, the checkout pages,
 `/admin`, `/paid`, `/healthz`), the scheduler and the outbox sender. They share one database and one
 `Core` ([`container.py`](../src/paidclub/container.py)): settings, the session factory, the clock,
 the provider registry and the billing policy.
@@ -17,6 +17,7 @@ flowchart LR
     SCH["Scheduler, every 30 s"] --> PAY
     SCH -- "POST /v3/payments, GET /v3/payments/{id}" --> YK
     SCH -- "getInvoices" --> CP
+    SCH -- "the USDT jetton wallet's transactions, one request a pass" --> TC["toncenter (TON)"]
     PAY --> DB[("SQLite or PostgreSQL")]
     BOT --> DB
     SCH --> DB
@@ -26,7 +27,7 @@ flowchart LR
 ```
 
 Every source of payment facts (a webhook, a renewal charge, a Telegram Stars update, a lookup of a
-checkout) produces a `PaymentSucceeded` or `PaymentFailed` event, and every event goes through
+checkout, USDT found in the owner's TON wallet) produces a `PaymentSucceeded` or `PaymentFailed` event, and every event goes through
 `apply_payment_event` in [`payments.py`](../src/paidclub/payments.py). That function is the only
 code that changes a subscription because of money. The state changes themselves are pure functions
 in [`domain/subscriptions.py`](../src/paidclub/domain/subscriptions.py): they take the current state
@@ -133,6 +134,9 @@ no migrations.
 | `charge_attempts` | One row per renewal charge, written before the provider call: `started`, `pending`, `succeeded`, `failed`, number of calls, last error, next lookup | `idempotence_key` unique; `(subscription_id, for_period, attempt)` unique |
 | `checkouts` | Payments a provider created for a checkout link (a YooKassa payment, a Crypto Pay invoice), looked up until decided | `(provider, provider_payment_id)` unique |
 | `stars_payment_updates` | Each Telegram Stars `successful_payment` as it arrived, stored before it is applied | `telegram_payment_charge_id` unique |
+| `ton_invoices` | What a member was asked to send to the owner's TON wallet: the price in USDT units, a comment unique to the checkout, what arrived so far, `open`, `paid` or `expired` | `comment` unique; `version` optimistic lock |
+| `ton_transfers` | Every USDT credit to the owner's jetton wallet that the poll found, with its invoice or none | `tx_hash` unique |
+| `ton_wallets` | The owner's USDT jetton wallet as the master gave it, pinned, with the logical time read up to and when it was last polled | `(owner_address, jetton_master)` unique |
 | `notifications` | The outbox: rendered text, buttons, status, attempts, `not_after`, lease columns | `key` unique |
 | `access_events` | Every join decision and removal attempt: approved, declined, failed, removed, removed on join, not a participant, skipped admin, skipped (has access), no rights, error | — |
 
@@ -176,10 +180,19 @@ passes on one database at the same time; how they split the work is under
    `expired` records a failed checkout.
 4. **Stars updates.** `stars_payment_updates` rows still `pending` are applied again, with waits
    doubling from 1 minute to an hour, 12 times; then the row is `failed` and the owner is alerted.
-5. **Expiry.** `past_due` subscriptions whose grace is over and that have no retry due, and
+5. **USDT on TON** ([`ton_payments.py`](../src/paidclub/ton_payments.py)). Open TON invoices whose
+   time is up become `expired`, and one that expired partly paid is reported to the owner and the
+   member. Then, if an invoice is open, the owner's USDT jetton wallet is read once, at most every
+   `PAIDCLUB_TON_POLL_SECONDS`; if one was paid or expired in the last week, every 5 minutes;
+   otherwise not at all. The very first poll asks the USDT master for the jetton wallet's address
+   (`get_wallet_address`) and pins it in `ton_wallets` instead. Each successful `internal_transfer`
+   into that wallet is stored by its hash, added to the invoice with its comment, and applied
+   through `apply_payment_event` once the invoice's transfers reach the price. The cursor moves
+   only past transactions of that wallet.
+6. **Expiry.** `past_due` subscriptions whose grace is over and that have no retry due, and
    `canceled` ones whose period is over (Stars: plus `stars_renewal_wait_minutes`), become
    `expired`, and the member is told.
-6. **Removal.** Expired subscriptions with no `access_revoked_at` are claimed. If the member is the
+7. **Removal.** Expired subscriptions with no `access_revoked_at` are claimed. If the member is the
    owner or an admin, or already has access through another subscription, nothing is done. Otherwise
    every club chat gets `getChatMember`, `banChatMember(until_date=now + 10 min)` and
    `unbanChatMember(only_if_banned=True)` ([`bot/revoker.py`](../src/paidclub/bot/revoker.py)). "Not
@@ -187,7 +200,7 @@ passes on one database at the same time; how they split the work is under
    are not, and the subscription is tried again after `PAIDCLUB_PROVIDER_RETRY_SECONDS`.
    `access_revoked_at` is set only when every chat gave a final answer. Missing rights alert the
    owner once a day per chat, and those removals are queued again when the bot gets its rights back.
-7. **Reminders.** For `active` and `canceled` subscriptions whose period ends within the largest
+8. **Reminders.** For `active` and `canceled` subscriptions whose period ends within the largest
    reminder offset, the closest offset that has passed is enqueued. A worker that was down during
    the 3-day window sends only the 1-day reminder, and an offset that would fall before the period
    start is skipped.
@@ -239,6 +252,8 @@ The loop sleeps one second when there is nothing to send.
 | A renewal charge | `paidclub-<subscription>-<period>-<attempt>`, attempt 0 for the regular renewal, 1 and 2 for retries | unique `charge_attempts.idempotence_key`; sent as YooKassa's `Idempotence-Key` header | YooKassa returns the first answer for 24 hours; after 23 hours the app searches `GET /v3/payments` for its metadata instead of sending again |
 | A checkout payment | a random UUID per checkout as `Idempotence-Key`; then `(provider, provider_payment_id)` | unique constraint on `checkouts` | the same key is reused once after a 5xx or a timeout; tapping "pay" twice makes two payment pages, and the second payment for the period is caught by the paid-period key |
 | A crypto period | the period in the invoice payload `paidclub:<subscription>:<period>` | paid-period key | a second invoice paid for the same period (the member tapped "pay" twice) is `needs_refund`, and the owner sends the coins back from @CryptoBot |
+| A TON transfer | the hash of the transaction that credited the owner's USDT jetton wallet | unique `ton_transfers.tx_hash`, written in the same transaction as what the transfer causes | stored and counted once, also when the indexer returns it again, a worker reads it twice, or the cursor was not saved before a crash |
+| A TON invoice | its comment, which is also the payment id | unique `ton_invoices.comment`, then `(provider, provider_payment_id)` and the paid-period key | applied once, when its transfers reach the price; a transfer with its comment after that is reported to the owner as money to return |
 | A Stars update | `telegram_payment_charge_id` | unique `stars_payment_updates.telegram_payment_charge_id` | stored once, applied once |
 | A Stars first payment | the period in the invoice payload `paidclub:<subscription>:<period>` | paid-period key | a second Telegram subscription bought from the same invoice is `needs_refund`, and it is cancelled with `editUserStarSubscription` |
 | A refund | `(provider, refund_id)` | unique constraint on `refunds` | answered as `duplicate` |
@@ -257,7 +272,9 @@ The message keys:
 | `payment_failed:<sub>:<period>:<attempt>` | renewal failed, pay button; dropped after `grace_until` |
 | `expired:<sub>:<periods paid>` | access ended |
 | `refunded:<provider>:<refund id>` | money returned, auto-renew off |
-| `owner:…` | alerts to the owner: an unknown subscription, a wrong amount or a payment to refund (per payment), a charge without an answer or given up (per charge key), a Stars payment that never applied (per charge id), missing rights, chat setup problems, people who joined without access, a provider refusal for the shop's own reasons, a lost notification (once a day each), a join request Telegram never took (once an hour) |
+| `ton_underpaid:<invoice>:<units received>` | USDT arrived short of the price: how much came and how much is left |
+| `ton_partial_expired:<invoice>` | a partly paid USDT checkout ran out of time; a top-up still counts |
+| `owner:…` | alerts to the owner: an unknown subscription, a wrong amount or a payment to refund (per payment), a charge without an answer or given up (per charge key), a Stars payment that never applied (per charge id), missing rights, chat setup problems, people who joined without access, a provider refusal for the shop's own reasons, a lost notification (once a day each), a join request Telegram never took (once an hour), USDT that matched no checkout, came after its checkout expired, overpaid it or arrived for a paid one, or could not be read (per transaction), a TON checkout that expired partly paid or was overpaid (per invoice), toncenter unreachable (once a day) |
 
 ## Concurrency
 
@@ -271,7 +288,8 @@ The message keys:
   out. Renewals, removals and outbox messages are claimed this way.
 - **Moving a timestamp as a claim.** Pending charges, checkouts and stored Stars updates are claimed
   by an `UPDATE` that moves their `next_check_at` or `next_attempt_at` forward, conditional on the
-  value just read; a second worker's update matches nothing.
+  value just read; a second worker's update matches nothing. The TON wallet poll is claimed the
+  same way, on `ton_wallets.polled_at`, so two workers make one request.
 - **Fenced writes.** The outbox records a result only `WHERE claim_token = <its token>`, and a
   removal sets `access_revoked_at` only while the subscription is still expired and still claimed by
   that worker.
@@ -301,6 +319,7 @@ Tests that run these races: `tests/test_db.py::test_two_concurrent_claims_never_
 | with the database down when a Stars payment arrives | storing is tried 4 times; then the owner gets a direct Telegram message with the charge id, outside the outbox, and the payment is logged at CRITICAL |
 | before a YooKassa checkout notification was handled | YooKassa sends it again for 24 hours, and the scheduler looks the payment up anyway |
 | before a Crypto Pay webhook was handled | the scheduler looks the invoice up with `getInvoices` |
+| after reading the TON wallet, before saving how far it read | the next poll reads the same transactions again; each is stored by its hash, so none counts twice |
 
 ## Stats
 
